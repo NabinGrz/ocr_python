@@ -50,13 +50,10 @@ class PokemonTCGClient:
         return []
 
     def _extract_root_name(self, name: str) -> str:
-        """Extract core Pokémon name (e.g. 'Mega GreninjaN' -> 'Greninja', 'Mewe' -> 'Mew')."""
+        """Extract core Pokémon name (e.g. 'Mega GreninjaN' -> 'Greninja', 'Mewe' -> 'Mew', 'Backtrack Badge' -> 'Backtrack Badge')."""
         words = [w for w in name.split() if w.lower() not in ("mega", "ex", "v", "vmax", "star", "gx", "stage1", "stage2", "basic")]
-        target = words[0] if words else name.split()[0]
-        cleaned = re.sub(r'[^a-zA-Z]', '', target)
-        # Strip trailing single noise char if present (e.g. GreninjaN -> Greninja)
-        if len(cleaned) > 4 and cleaned[-1].isupper():
-            cleaned = cleaned[:-1]
+        target = " ".join(words) if words else name
+        cleaned = re.sub(r'[^a-zA-Z\s]', '', target).strip()
         return cleaned
 
     def verify_card(
@@ -80,29 +77,36 @@ class PokemonTCGClient:
         else:
             num_query = None
 
-        # Strategy 1: Search by root Pokémon name (Returns ~10-40 cards across all sets in ONE request)
+        # Strategy 1: Search by root Pokémon name
         if ocr_name:
             root_name = self._extract_root_name(ocr_name)
             if root_name:
-                data = self._safe_get({"q": f"name:{root_name}"})
+                data = self._safe_get({"q": f'name:"{root_name}"'})
+                if not data:
+                    data = self._safe_get({"q": f"name:{root_name}*"})
                 candidates.extend(data)
 
-        # Strategy 2: Search by Collector Number (if name search yielded no results)
-        if not candidates and num_query:
+        # Strategy 2: Search by Collector Number
+        if num_query:
             data = self._safe_get({"q": f"number:{num_query}"})
-            candidates.extend(data)
+            existing_ids = {c.get("id") for c in candidates}
+            for c in data:
+                if c.get("id") not in existing_ids:
+                    candidates.append(c)
 
         if not candidates:
             return {
                 "verified": False,
                 "match": None,
                 "confidence": 0.0,
+                "best_score": 0.0,
                 "message": "No cards found in API database.",
             }
 
         # Candidate Ranking System
         best_match = None
         best_score = -1.0
+        best_subscores_count = 0
 
         for card in candidates:
             card_name = card.get("name", "")
@@ -111,8 +115,20 @@ class PokemonTCGClient:
             set_total = str(card.get("set", {}).get("printedTotal", ""))
             card_number = str(card.get("number", ""))
 
-            # Score calculations
-            total_score = 100.0 if (target_total_raw and set_total == target_total_raw) else 0.0
+            # Total score calculation (compare stripped leading zeros so '84' matches '084')
+            total_score = 0.0
+            if target_total_raw and set_total:
+                target_stripped = target_total_raw.lstrip("0") or "0"
+                set_stripped = set_total.lstrip("0") or "0"
+                if set_stripped == target_stripped or set_total == target_total_raw:
+                    total_score = 100.0
+                elif abs(int(set_stripped) - int(target_stripped)) <= 2:
+                    total_score = 60.0
+                elif len(set_stripped) == len(target_stripped):
+                    diffs = sum(1 for a, b in zip(set_stripped, target_stripped) if a != b)
+                    if diffs == 1:
+                        total_score = 50.0  # Single-digit misread partial credit
+
             hp_score    = 100.0 if (ocr_hp and card_hp and ocr_hp == card_hp) else (40.0 if not ocr_hp else 0.0)
             name_score  = float(fuzz.partial_ratio(ocr_name.lower(), card_name.lower())) if ocr_name else 50.0
 
@@ -127,11 +143,16 @@ class PokemonTCGClient:
             # Weighted final score
             final_score = (total_score * 0.40) + (hp_score * 0.20) + (name_score * 0.20) + (num_score * 0.20)
 
+            # Count non-zero sub-scores for verification threshold gate
+            subscores_count = sum(1 for score in (total_score, hp_score, name_score, num_score) if score > 0)
+
             if final_score > best_score:
                 best_score = final_score
                 best_match = card
+                best_subscores_count = subscores_count
 
-        if best_match and best_score >= 40.0:
+        # Bug 5 Fix: Require best_score >= 45.0 AND at least 2 non-zero sub-scores to prevent weak/false matches
+        if best_match and best_score >= 45.0 and best_subscores_count >= 2:
             card_number_str   = str(best_match.get("number", ""))
             printed_total_str = str(best_match.get("set", {}).get("printedTotal", ""))
 
@@ -153,6 +174,7 @@ class PokemonTCGClient:
             return {
                 "verified": True,
                 "confidence": round(min(best_score / 100.0, 1.0), 2),
+                "best_score": round(best_score, 1),  # Bug 5 Fix: Return raw best_score for visibility
                 "name": best_match.get("name"),
                 "hp": best_match.get("hp"),
                 "collector_id": formatted_id,
@@ -168,5 +190,6 @@ class PokemonTCGClient:
             "verified": False,
             "match": None,
             "confidence": 0.0,
+            "best_score": round(best_score, 1) if best_score > 0 else 0.0,  # Bug 5 Fix: Expose best_score on failure
             "message": "No confident database match found.",
         }

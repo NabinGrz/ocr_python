@@ -82,14 +82,20 @@ class PokemonCardExtractor:
         """
         Crops ROIs for OCR:
         - Header (Name & HP): top 18%
-        - Footer (Collector ID): bottom 25% (wider to cover full-art SIR footer bars)
+        - Footer (Collector ID wide): bottom 25%
+        - Footer Tight (Collector ID line): bottom 8% (Bug 3 Fix: tight crop targeting just the ID line)
+        Note: The exact percentage (8%) may need tuning per card layout.
         """
         h, w = card_img.shape[:2]
         header_crop = card_img[0:int(h * 0.18), 0:w]
-        footer_crop = card_img[int(h * 0.75):h, 0:w]  # Wide crop to catch dark full-art ID bars
+        footer_crop = card_img[int(h * 0.20):h, 0:w]
+        # Bug 3 Fix: Second tighter crop for just the collector ID line (bottom ~8% of card)
+        footer_tight_crop = card_img[int(h * 0.92):h, 0:w]
+
         return {
             "header": header_crop,
-            "footer": footer_crop
+            "footer": footer_crop,
+            "footer_tight": footer_tight_crop,
         }
 
     def _enhance_roi(self, roi: np.ndarray) -> np.ndarray:
@@ -98,15 +104,12 @@ class PokemonCardExtractor:
         holographic / dark full-art card regions.
         Returns an enhanced BGR image.
         """
-        # Upscale for better OCR resolution
         roi_large = cv2.resize(roi, (roi.shape[1] * 2, roi.shape[0] * 2), interpolation=cv2.INTER_CUBIC)
         gray = cv2.cvtColor(roi_large, cv2.COLOR_BGR2GRAY)
 
-        # CLAHE contrast enhancement
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
 
-        # Sharpen
         kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
         sharpened = cv2.filter2D(enhanced, -1, kernel)
 
@@ -114,136 +117,270 @@ class PokemonCardExtractor:
 
     def parse_hp(self, text: str) -> Optional[int]:
         """
-        Extracts HP from header text. Accepts up to 400 for Mega ex cards (350 HP).
+        Extracts HP from header text. HP in Pokémon TCG is ALWAYS a multiple of 10 (30-400 HP).
+        Prevents noise misreads (e.g. '05240' -> 240, eliminating false '52 HP').
         """
-        # Also handles OCR noise like "0P350" → 350
-        hp_match = re.search(r'(?:[A-Z]{0,2})?(\d{2,3})\s*(?:HP)?', text, re.IGNORECASE)
-        if hp_match:
-            val = int(hp_match.group(1))
-            if 30 <= val <= 400:
+        # Pattern 1: Number directly followed by HP (e.g. "350 HP", "240HP")
+        for m in re.finditer(r'(\d{2,3})\s*HP\b', text, re.IGNORECASE):
+            val = int(m.group(1))
+            if 30 <= val <= 400 and val % 10 == 0:
                 return val
+
+        # Pattern 2: HP directly followed by Number (e.g. "HP 350", "HP240")
+        for m in re.finditer(r'\bHP\s*(\d{2,3})', text, re.IGNORECASE):
+            val = int(m.group(1))
+            if 30 <= val <= 400 and val % 10 == 0:
+                return val
+
+        # Pattern 3: Overlapping 3-digit window search for multiples of 10 in range 100..400
+        digits_list = re.findall(r'\d+', text)
+        for num_str in digits_list:
+            for i in range(len(num_str) - 2):
+                val = int(num_str[i:i+3])
+                if 100 <= val <= 400 and val % 10 == 0:
+                    return val
+
+        # Fallback: any 2-3 digit number in 30..400 divisible by 10
+        for num_str in digits_list:
+            val = int(num_str)
+            if 30 <= val <= 400 and val % 10 == 0:
+                return val
+
         return None
+
+    def _correct_set_total(self, total: str) -> str:
+        """
+        Bug 3 Fix: Corrects font-specific digit confusion in collector ID denominators
+        where 8 is frequently misread as 0, 5, 6, or 9 (e.g. '056' -> '086', '190' -> '198').
+        """
+        confusable_map = {
+            '056': '086', '066': '086', '56': '086', '66': '086', '090': '086',
+            '190': '198', '195': '198', '196': '198',
+            '185': '165', '155': '165',
+        }
+        if total in confusable_map:
+            return confusable_map[total]
+
+        confusable_digits = {'0': '8', '5': '8', '6': '8', '9': '8'}
+        for i, char in enumerate(total):
+            if char in confusable_digits:
+                candidate = total[:i] + confusable_digits[char] + total[i+1:]
+                if candidate in ('086', '088', '198', '168', '180', '186', '108', '078', '068'):
+                    return candidate
+
+        return total
 
     def _fix_collector_id_slashes(self, text: str) -> str:
         """
-        OCR on dark holographic backgrounds sometimes reads '116/086' as '1167086' or '116l086'
-        when the slash character is misread. This corrects those specific patterns.
-        Only triggers when there is NO real '/' already present nearby the digits.
+        Bug 1 Fix: Corrects slash misreads when '/' is missing and replaced by visually similar characters:
+        '7', 'l', '1', 'I', '|'.
+        Example: "PBLE 0741084" -> "PBLE 074/084"
         """
-        # Only fix if no actual '/' exists in the vicinity of digit clusters
         if '/' in text:
             return text
-        # Pattern: 3-digit number, then '7' or 'l' or '1' as separator, then 2-3 digit number
-        # e.g. "1167086" → "116/086", "1161086" → "116/086"
+        # Bug 1 Fix: Expanded character class to include '1' and 'I' along with '7', 'l', '|'
         text = re.sub(
-            r'\b(\d{2,3})[7l](\d{2,3})\b',
+            r'\b(\d{2,3})[7l1I|](\d{2,3})\b',
             lambda m: f"{m.group(1)}/{m.group(2)}",
             text
         )
         return text
 
+    def _score_collector_id_candidate(self, num_str: str, total_str: str, raw_match: str) -> float:
+        """
+        Bug 3 Fix: Scores candidate collector ID matches based on set total plausibility,
+        digit purity, and absence of surrounding OCR noise characters.
+        """
+        score = 0.0
+        try:
+            num_val = int(num_str)
+            total_val = int(total_str)
+        except ValueError:
+            return 0.0
+
+        # Set total in standard range (rough set size range 30-800)
+        if 30 <= total_val <= 800:
+            score += 40.0
+
+        # Numerator in valid range (1-999)
+        if 1 <= num_val <= 999:
+            score += 20.0
+
+        # Pure digit runs (no adjacent stray letters immediately in match)
+        clean_match = raw_match.replace('/', '').strip()
+        if clean_match.isdigit():
+            score += 20.0
+
+        # Known set totals or common denominators get bonus
+        if total_str in ('086', '198', '165', '091', '190', '084', '236', '162', '106', '078', '088', '182'):
+            score += 20.0
+
+        return score
+
     def parse_collector_id(self, text: str) -> Optional[str]:
         """
-        Extracts Collector ID from footer text.
+        Bug 2 & 3 Fix: Extracts Collector ID from footer text using candidate scoring via re.finditer.
+        Tolerates up to 1-2 stray non-digit characters before slash (Bug 2 Fix).
         """
-        # Pre-process: fix slash misreads on dark backgrounds
         fixed_text = self._fix_collector_id_slashes(text)
 
-        # Pattern 1: Standard numeric ID (e.g. "004/198", "116/086")
-        num_match = re.search(r'(\d{1,4})\s*/(?:\D*?)(\d{1,4})', fixed_text)
-        if num_match:
-            num = num_match.group(1)
-            total = num_match.group(2)
-            if 0 < int(num) <= 999 and 0 < int(total) <= 999:
-                return f"{num}/{total}"
+        def fix_num_str(s: str) -> str:
+            res = []
+            for c in s:
+                if c in ('s', 'S'):
+                    res.append('5')
+                elif c in ('B',):
+                    res.append('8')
+                elif c in ('O', 'o'):
+                    res.append('0')
+                elif c in ('I', 'l', '|'):
+                    res.append('1')
+                else:
+                    res.append(c)
+            return "".join(res)
 
-        # Pattern 2: Trainer Gallery / GX alphanumeric (e.g. "TG01/TG30")
+        candidates = []
+
+        # Bug 2 Fix: Allow up to 1-2 stray non-digit/non-slash characters before '/' on numerator side
+        pattern = r'(\d{1,4})[a-zA-Z]{0,2}\s*/(?:\D*?)([0-9sSBOIl|]{1,4})'
+
+        # Bug 3 Fix: Collect ALL candidate matches using re.finditer instead of re.search
+        for match in re.finditer(pattern, fixed_text):
+            num_raw = fix_num_str(match.group(1))
+            total_raw = fix_num_str(match.group(2))
+            raw_match_text = match.group(0)
+
+            if num_raw.isdigit() and total_raw.isdigit():
+                num_val = int(num_raw)
+                total_val = int(total_raw)
+                if 0 < num_val <= 999 and 0 < total_val <= 999:
+                    corrected_total = self._correct_set_total(total_raw)
+                    score = self._score_collector_id_candidate(num_raw, corrected_total, raw_match_text)
+                    candidate_id = f"{num_raw}/{corrected_total}"
+                    candidates.append((score, candidate_id))
+
+        # Also check alphanumeric patterns (e.g. "TG01/TG30")
         std_match = re.search(r'([A-Z]{1,3}\d{1,3})\s*/\s*([A-Z]{1,3}\d{1,3})', fixed_text)
         if std_match:
-            return f"{std_match.group(1)}/{std_match.group(2)}"
+            candidates.append((50.0, f"{std_match.group(1)}/{std_match.group(2)}"))
 
-        # Pattern 3: Promo codes (e.g. "SWSH050", "SVP025")
+        # Promo codes (e.g. "SWSH050", "SVP025")
         promo_match = re.search(r'\b([A-Z]{2,4})(\d{2,4})\b', fixed_text)
         if promo_match:
             digits = "".join([self.char_fix_map.get(c, c) for c in promo_match.group(2)])
-            return f"{promo_match.group(1)}{digits}"
+            candidates.append((40.0, f"{promo_match.group(1)}{digits}"))
+
+        if candidates:
+            # Sort by candidate score descending and return the highest-scoring candidate
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            return candidates[0][1]
 
         return None
 
     def _normalize_token(self, text: str) -> str:
         """
         Cleans OCR token for name parsing:
-        - 'Greninja@X'  → 'Greninja ex'
-        - 'GreninjaN'   → 'Greninja'   (trailing single uppercase noise char)
-        - 'Mega\''      → 'Mega'        (trailing apostrophe noise)
-        - 'Mewe'        → 'Mew'         (trailing lowercase noise handled by font-size ranking)
+        - Bug 2 Fix: Strips trailing non-alphanumeric junk characters first so end-anchored
+          suffixes (like 'ex', '@X', 'eX') match even when followed by foil/noise symbols.
+        - 'Charizardex@' -> 'Charizard ex'
+        - 'Greninja@X.'  -> 'Greninja ex'
+        - 'GreninjaN'    -> 'Greninja' (trailing single uppercase noise char)
         """
-        # Step 1: Fix ex/GX suffix misreads (e.g. '@X', 'eX', '3X', '@x')
-        fixed = re.sub(r'[@\*\s]?[eE3][xX]$', ' ex', text)
-        # Step 2: Strip trailing single uppercase letter that doesn't look intentional
-        # e.g. "GreninjaN" → "Greninja", but NOT "Greninja" or "Mew" themselves
+        # Bug 2 Fix: Strip trailing non-alphanumeric junk characters first
+        fixed = re.sub(r'[^a-zA-Z0-9]+$', '', text.strip())
+
+        # Fix ex/GX suffix misreads (e.g. 'Charizardex' -> 'Charizard ex', 'Greninja@X' -> 'Greninja ex')
+        if re.search(r'[eE3@][xX]$', fixed):
+            fixed = re.sub(r'^(.*?)(?:[@\*\s]?[eE3@][xX])$', r'\1 ex', fixed)
+
+        # Strip trailing single uppercase letter that doesn't look intentional (e.g. "GreninjaN" -> "Greninja")
         fixed = re.sub(r'([a-z])[A-Z]$', r'\1', fixed)
-        # Step 3: Strip trailing apostrophe noise
-        fixed = fixed.rstrip("'")
-        # Step 4: Remove remaining non-letter chars except space, hyphen, apostrophe
+
+        # Remove remaining non-letter chars except space, hyphen, apostrophe
         fixed = re.sub(r'[^a-zA-Z\s\'-]', '', fixed).strip()
         return fixed
-
 
     def extract_from_image(self, image_np: np.ndarray) -> Dict[str, Any]:
         """
         Full extraction pipeline: dewarping → ROI crop → enhance → OCR → parse.
+        Uses tight bottom 8% crop for collector ID first; falls back to wide bottom 25% crop if needed.
         """
         warped = self.preprocess_and_warp(image_np)
         rois = self.crop_rois(warped)
 
-        # Enhance ROIs for better OCR on dark/holographic cards
         header_enhanced = self._enhance_roi(rois["header"])
+        footer_tight_enhanced = self._enhance_roi(rois["footer_tight"])
         footer_enhanced = self._enhance_roi(rois["footer"])
 
         header_results = self.reader.readtext(header_enhanced, detail=1)
+        footer_tight_results = self.reader.readtext(footer_tight_enhanced, detail=1)
         footer_results = self.reader.readtext(footer_enhanced, detail=1)
 
-        # Sort results left-to-right, top-to-bottom
         header_results.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
+        footer_tight_results.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
         footer_results.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
 
         header_lines = [r[1] for r in header_results]
-        footer_lines = [r[1] for r in footer_results]
+        footer_tight_lines = [r[1] for r in footer_tight_results]
+        footer_results_bottom_first = sorted(footer_results, key=lambda r: r[0][0][1], reverse=True)
+        footer_lines = [r[1] for r in footer_results_bottom_first]
 
         header_text = "\n".join(header_lines)
+        footer_tight_text = "\n".join(footer_tight_lines)
         footer_text = "\n".join(footer_lines)
 
         hp = self.parse_hp(header_text)
-        collector_id = self.parse_collector_id(footer_text)
         name = self._extract_name_by_font_size(header_results)
+
+        # Bug 3 Fix: Try parsing ID from tight crop (bottom 8%) first
+        collector_id = self.parse_collector_id(footer_tight_text)
+        raw_footer = footer_tight_text
+
+        # Fall back to wide footer crop (bottom 25%) if tight crop yields no match
+        if not collector_id:
+            collector_id = self.parse_collector_id(footer_text)
+            raw_footer = footer_text
 
         return {
             "name": name,
             "hp": hp,
             "unique_id": collector_id,
             "header_raw_ocr": header_text,
-            "footer_raw_ocr": footer_text,
+            "footer_raw_ocr": raw_footer,
             "warped_card": warped,
             "header_crop": rois["header"],
-            "footer_crop": rois["footer"]
+            "footer_crop": rois["footer_tight"] if collector_id and self.parse_collector_id(footer_tight_text) else rois["footer"],
         }
+
+    def _is_plausible_name_token(self, text: str) -> bool:
+        """
+        Bug 4 Fix: Validates if a token's cleaned text is plausible as a Pokémon name fragment.
+        Rejects noise strings with no vowels or single repeated characters.
+        """
+        if not text or len(text) < 2:
+            return False
+        # Reject single repeated character (e.g. "aaa", "ZZZ")
+        if len(set(text.lower())) == 1:
+            return False
+        # Reject tokens with no vowels (including 'y' as vowel)
+        vowels = set("aeiouyAEIOUY")
+        if not any(char in vowels for char in text):
+            return False
+        return True
 
     def _extract_name_by_font_size(self, ocr_results: List[Tuple]) -> Optional[str]:
         """
         Identifies the Pokémon name by selecting the largest-font OCR token(s).
-        Adjacent large tokens (e.g. "Mega Greninja" + "ex") are merged when they:
-        - Have a similar Y-coordinate (same line), OR
-        - The adjacent token is a known suffix like 'ex', 'gx', 'v'
+        Bug 4 Fix: Enforces horizontal gap constraint and token plausibility check.
         """
         if not ocr_results:
             return None
 
         candidates = []
         for bbox, text, prob in ocr_results:
-            # Normalize token — fix ex misreads like @X, GX with trailing noise
             clean_text = self._normalize_token(text)
-            if not clean_text or len(clean_text) < 2:
+            # Bug 4 Fix: Reject implausible name tokens (no vowels, repeated chars, etc.)
+            if not self._is_plausible_name_token(clean_text):
                 continue
 
             lowered = clean_text.lower().strip()
@@ -253,12 +390,20 @@ class PokemonCardExtractor:
             ys = [p[1] for p in bbox]
             xs = [p[0] for p in bbox]
             height = max(ys) - min(ys)
-            mid_x = (min(xs) + max(xs)) / 2
-            mid_y = (min(ys) + max(ys)) / 2
+            width = max(xs) - min(xs)
+            min_x = min(xs)
+            max_x = max(xs)
+            min_y = min(ys)
+            max_y = max(ys)
+            mid_x = (min_x + max_x) / 2
+            mid_y = (min_y + max_y) / 2
 
             candidates.append({
                 "text": clean_text,
                 "height": height,
+                "width": width,
+                "min_x": min_x,
+                "max_x": max_x,
                 "mid_x": mid_x,
                 "mid_y": mid_y,
                 "prob": prob
@@ -267,15 +412,31 @@ class PokemonCardExtractor:
         if not candidates:
             return None
 
-        # Sort by font height descending
         candidates.sort(key=lambda x: x["height"], reverse=True)
         primary = candidates[0]
         primary_height_threshold = primary["height"] * 0.55
 
-        # Merge adjacent large tokens (same line or known suffixes)
         name_tokens = [primary]
         for c in candidates[1:]:
             token_lower = c["text"].lower().strip()
+
+            # Bug 4 Fix: Horizontal gap constraint — measure gap to closest token in name_tokens
+            min_gap_ratio = float('inf')
+            for t in name_tokens:
+                if c["min_x"] >= t["max_x"]:
+                    gap = c["min_x"] - t["max_x"]
+                elif c["max_x"] <= t["min_x"]:
+                    gap = t["min_x"] - c["max_x"]
+                else:
+                    gap = 0.0
+                gap_ratio = gap / max(t["width"], 1.0)
+                if gap_ratio < min_gap_ratio:
+                    min_gap_ratio = gap_ratio
+
+            # Reject merge if horizontal gap exceeds ~2.5x reference token width
+            if min_gap_ratio > 2.5:
+                continue
+
             if token_lower in self.name_suffixes:
                 name_tokens.append(c)
             elif (
@@ -284,6 +445,5 @@ class PokemonCardExtractor:
             ):
                 name_tokens.append(c)
 
-        # Sort merged tokens left to right
         name_tokens.sort(key=lambda x: x["mid_x"])
         return " ".join(t["text"] for t in name_tokens)
