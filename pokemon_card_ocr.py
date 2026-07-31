@@ -87,8 +87,8 @@ class PokemonCardExtractor:
         Note: The exact percentage (8%) may need tuning per card layout.
         """
         h, w = card_img.shape[:2]
-        header_crop = card_img[0:int(h * 0.18), 0:w]
-        footer_crop = card_img[int(h * 0.20):h, 0:w]
+        header_crop = card_img[0:int(h * 0.12), 0:w]
+        footer_crop = card_img[int(h * 0.18):h, 0:w]
         # Bug 3 Fix: Second tighter crop for just the collector ID line (bottom ~8% of card)
         footer_tight_crop = card_img[int(h * 0.92):h, 0:w]
 
