@@ -173,14 +173,22 @@ class PokemonCardExtractor:
     def _normalize_token(self, text: str) -> str:
         """
         Cleans OCR token for name parsing:
-        - 'Greninja@X' → 'Greninja ex'
-        - 'GreninjaeX' → 'Greninja ex'
+        - 'Greninja@X'  → 'Greninja ex'
+        - 'GreninjaN'   → 'Greninja'   (trailing single uppercase noise char)
+        - 'Mega\''      → 'Mega'        (trailing apostrophe noise)
+        - 'Mewe'        → 'Mew'         (trailing lowercase noise handled by font-size ranking)
         """
-        # Fix ex suffix misreads (e.g. '@X', 'eX', '3X', '@x')
+        # Step 1: Fix ex/GX suffix misreads (e.g. '@X', 'eX', '3X', '@x')
         fixed = re.sub(r'[@\*\s]?[eE3][xX]$', ' ex', text)
-        # Remove remaining non-letter chars except space, hyphen, apostrophe
+        # Step 2: Strip trailing single uppercase letter that doesn't look intentional
+        # e.g. "GreninjaN" → "Greninja", but NOT "Greninja" or "Mew" themselves
+        fixed = re.sub(r'([a-z])[A-Z]$', r'\1', fixed)
+        # Step 3: Strip trailing apostrophe noise
+        fixed = fixed.rstrip("'")
+        # Step 4: Remove remaining non-letter chars except space, hyphen, apostrophe
         fixed = re.sub(r'[^a-zA-Z\s\'-]', '', fixed).strip()
         return fixed
+
 
     def extract_from_image(self, image_np: np.ndarray) -> Dict[str, Any]:
         """
