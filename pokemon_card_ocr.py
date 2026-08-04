@@ -83,13 +83,25 @@ class PokemonCardExtractor:
                 if len(approx) == 4:
                     pts = approx.reshape(4, 2)
                     rect = self._order_points(pts)
-                    dst = np.array([[0, 0], [629, 0], [629, 879], [0, 879]], dtype="float32")
-                    M = cv2.getPerspectiveTransform(rect, dst)
-                    return cv2.warpPerspective(image, M, (630, 880))
+
+                    # Aspect Ratio Sanity Check (Standard Pokémon TCG card = 63mm / 88mm = 0.716)
+                    w_top = np.linalg.norm(rect[1] - rect[0])
+                    w_bot = np.linalg.norm(rect[2] - rect[3])
+                    h_left = np.linalg.norm(rect[3] - rect[0])
+                    h_right = np.linalg.norm(rect[2] - rect[1])
+                    avg_w = (w_top + w_bot) / 2.0
+                    avg_h = (h_left + h_right) / 2.0
+                    aspect = avg_w / max(avg_h, 1.0)
+
+                    if 0.55 <= aspect <= 0.88:
+                        dst = np.array([[0, 0], [629, 0], [629, 879], [0, 879]], dtype="float32")
+                        M = cv2.getPerspectiveTransform(rect, dst)
+                        return cv2.warpPerspective(image, M, (630, 880))
                 else:
-                    # Bounding rect fallback for camera photos with rounded corners or tilted edges
+                    # Bounding rect fallback with aspect ratio validation
                     bx, by, bw, bh = cv2.boundingRect(c)
-                    if bw > 100 and bh > 100:
+                    aspect = bw / float(max(bh, 1))
+                    if bw > 100 and bh > 100 and 0.55 <= aspect <= 0.88:
                         cropped = image[by:by+bh, bx:bx+bw]
                         return cv2.resize(cropped, (630, 880))
 
