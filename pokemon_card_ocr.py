@@ -175,9 +175,17 @@ class PokemonCardExtractor:
 
     def _correct_set_total(self, total: str) -> str:
         """
-        Bug 3 Fix: Corrects font-specific digit confusion in collector ID denominators
-        where 8 is frequently misread as 0, 5, 6, or 9 (e.g. '056' -> '086', '190' -> '198').
+        Corrects font-specific digit confusion in collector ID denominators (e.g. '056' -> '086').
+        Protects valid known set totals from being corrupted.
         """
+        # Protect known valid Pokémon set totals and subset sizes from being corrupted
+        known_valid_totals = {
+            '165', '198', '197', '182', '086', '088', '091', '078', '207', '159',
+            '084', '236', '162', '106', '180', '186', '068', '108', '070', '30', '70', '25', '94', '122'
+        }
+        if total in known_valid_totals:
+            return total
+
         confusable_map = {
             '056': '086', '066': '086', '56': '086', '66': '086', '090': '086',
             '190': '198', '195': '198', '196': '198',
@@ -197,15 +205,14 @@ class PokemonCardExtractor:
 
     def _fix_collector_id_slashes(self, text: str) -> str:
         """
-        Bug 1 Fix: Corrects slash misreads when '/' is missing and replaced by visually similar characters:
+        Corrects slash misreads when '/' is missing and replaced by visually similar characters:
         '7', 'l', '1', 'I', '|'.
         Example: "PBLE 0741084" -> "PBLE 074/084"
         """
         if '/' in text:
             return text
-        # Bug 1 Fix: Expanded character class to include '1' and 'I' along with '7', 'l', '|'
         text = re.sub(
-            r'\b(\d{2,3})[7l1I|](\d{2,3})\b',
+            r'\b([A-Za-z0-9]{2,5})[7l1I|](\d{2,4})\b',
             lambda m: f"{m.group(1)}/{m.group(2)}",
             text
         )
@@ -213,52 +220,57 @@ class PokemonCardExtractor:
 
     def _score_collector_id_candidate(self, num_str: str, total_str: str, raw_match: str) -> float:
         """
-        Bug 3 Fix: Scores candidate collector ID matches based on set total plausibility,
-        digit purity, and absence of surrounding OCR noise characters.
+        Scores candidate collector ID matches based on set total plausibility,
+        digit purity, and special card status (Secret Rares / SIRs / Subsets).
         """
         score = 0.0
         try:
-            num_val = int(num_str)
-            total_val = int(total_str)
+            # Extract numeric values if present
+            num_digits = re.sub(r'\D', '', num_str)
+            total_digits = re.sub(r'\D', '', total_str)
+            num_val = int(num_digits) if num_digits else 0
+            total_val = int(total_digits) if total_digits else 0
         except ValueError:
             return 0.0
 
-        # Set total in standard range (rough set size range 30-800)
-        if 30 <= total_val <= 800:
+        # Set total in standard range (rough set size range 20-800)
+        if 20 <= total_val <= 800:
             score += 40.0
 
         # Numerator in valid range (1-999)
         if 1 <= num_val <= 999:
             score += 20.0
 
-        # Pure digit runs (no adjacent stray letters immediately in match)
-        clean_match = raw_match.replace('/', '').strip()
-        if clean_match.isdigit():
-            score += 20.0
+        # Secret Rare / SIR Bonus: Numerator > Denominator (e.g. 199/165, 251/198, 223/197)
+        if num_val > total_val and total_val >= 30:
+            score += 25.0
 
         # Known set totals or common denominators get bonus
-        if total_str in ('086', '198', '165', '091', '190', '084', '236', '162', '106', '078', '088', '182'):
+        if total_str in ('086', '198', '165', '091', '190', '084', '236', '162', '106', '078', '088', '182', '30', '70', '25'):
             score += 20.0
 
         return score
 
     def parse_collector_id(self, text: str) -> Optional[str]:
         """
-        Bug 2 & 3 Fix: Extracts Collector ID from footer text using candidate scoring via re.finditer.
-        Tolerates up to 1-2 stray non-digit characters before slash (Bug 2 Fix).
+        Extracts Collector ID from footer text with support for:
+        - Standard numbers (074/084)
+        - Secret Rares / SIRs (199/165, 251/198)
+        - Trainer Gallery / Special Subsets (TG01/TG30, GG12/GG70, RC01/RC25, SV01/SV94)
+        - Promos (SWSH050, SVP025, SM210, XY100)
         """
         fixed_text = self._fix_collector_id_slashes(text)
 
         def fix_num_str(s: str) -> str:
             res = []
             for c in s:
-                if c in ('s', 'S'):
+                if c in ('s', 'S') and not s.startswith(('SWSH', 'SV', 'SM')):
                     res.append('5')
-                elif c in ('B',):
+                elif c in ('B',) and not s.startswith(('BW',)):
                     res.append('8')
-                elif c in ('O', 'o'):
+                elif c in ('O', 'o') and not s.startswith(('PROMO', 'TG', 'GG')):
                     res.append('0')
-                elif c in ('I', 'l', '|'):
+                elif c in ('I', 'l', '|') and not s.startswith(('TG', 'GG', 'RC', 'SV', 'SWSH', 'SVP')):
                     res.append('1')
                 else:
                     res.append(c)
@@ -266,10 +278,20 @@ class PokemonCardExtractor:
 
         candidates = []
 
-        # Bug 2 Fix: Allow up to 1-2 stray non-digit/non-slash characters before '/' on numerator side
-        pattern = r'(\d{1,4})[a-zA-Z]{0,2}\s*/(?:\D*?)([0-9sSBOIl|]{1,4})'
+        # 1. Special Subset Alphanumeric Patterns (e.g., "TG01/TG30", "GG12/70", "RC01/RC25", "SV01/SV94")
+        subset_matches = re.finditer(r'\b([A-Za-z]{1,3}\d{1,4})\s*/\s*([A-Za-z]{0,3}\d{1,4})\b', fixed_text)
+        for match in subset_matches:
+            candidates.append((90.0, f"{match.group(1).upper()}/{match.group(2).upper()}"))
 
-        # Bug 3 Fix: Collect ALL candidate matches using re.finditer instead of re.search
+        # 2. Promo Cards (e.g., "SWSH050", "SWSH 050", "SVP025", "SVP 025", "SM210", "XY100")
+        promo_matches = re.finditer(r'\b(SWSH|SVP|SM|XY|BW|HGSS|DP|S-P|SV-P|PROMO)\s*(\d{2,4})\b', fixed_text, re.IGNORECASE)
+        for match in promo_matches:
+            prefix = match.group(1).upper()
+            digits = "".join([self.char_fix_map.get(c, c) for c in match.group(2)])
+            candidates.append((85.0, f"{prefix}{digits}"))
+
+        # 3. Numeric Card ID Patterns (including Secret Rares / SIRs like "199/165", "251/198")
+        pattern = r'(\d{1,4})[a-zA-Z]{0,2}\s*/(?:\D*?)([0-9sSBOIl|]{1,4})'
         for match in re.finditer(pattern, fixed_text):
             num_raw = fix_num_str(match.group(1))
             total_raw = fix_num_str(match.group(2))
@@ -284,19 +306,8 @@ class PokemonCardExtractor:
                     candidate_id = f"{num_raw}/{corrected_total}"
                     candidates.append((score, candidate_id))
 
-        # Also check alphanumeric patterns (e.g. "TG01/TG30")
-        std_match = re.search(r'([A-Z]{1,3}\d{1,3})\s*/\s*([A-Z]{1,3}\d{1,3})', fixed_text)
-        if std_match:
-            candidates.append((50.0, f"{std_match.group(1)}/{std_match.group(2)}"))
-
-        # Promo codes (e.g. "SWSH050", "SVP025")
-        promo_match = re.search(r'\b([A-Z]{2,4})(\d{2,4})\b', fixed_text)
-        if promo_match:
-            digits = "".join([self.char_fix_map.get(c, c) for c in promo_match.group(2)])
-            candidates.append((40.0, f"{promo_match.group(1)}{digits}"))
-
         if candidates:
-            # Sort by candidate score descending and return the highest-scoring candidate
+            # Sort by candidate score descending and return highest scoring candidate
             candidates.sort(key=lambda x: x[0], reverse=True)
             return candidates[0][1]
 

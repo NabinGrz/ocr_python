@@ -140,30 +140,57 @@ class PokemonTCGClient:
             set_total = str(card.get("set", {}).get("printedTotal", ""))
             card_number = str(card.get("number", ""))
 
-            # Total score calculation (compare stripped leading zeros so '84' matches '084')
+            target_digits = re.sub(r'\D', '', target_total_raw) if target_total_raw else ""
+            set_digits = re.sub(r'\D', '', set_total) if set_total else ""
+
+            # Check if this card belongs to a special subset / promo (TG, GG, SV, RC, SWSH, SVP)
+            is_special_subset = any(
+                card_number.upper().startswith(p) or (num_query and num_query.upper().startswith(p))
+                for p in ('TG', 'GG', 'SV', 'RC', 'SWSH', 'SVP', 'W', 'PROMO')
+            )
+
+            # Total score calculation
             total_score = 0.0
             if target_total_raw and set_total:
-                target_stripped = target_total_raw.lstrip("0") or "0"
-                set_stripped = set_total.lstrip("0") or "0"
-                if set_stripped == target_stripped or set_total == target_total_raw:
+                if target_total_raw.upper() == set_total.upper() or (target_digits and target_digits == set_digits):
                     total_score = 100.0
-                elif abs(int(set_stripped) - int(target_stripped)) <= 2:
-                    total_score = 60.0
-                elif len(set_stripped) == len(target_stripped):
-                    diffs = sum(1 for a, b in zip(set_stripped, target_stripped) if a != b)
-                    if diffs == 1:
-                        total_score = 50.0  # Single-digit misread partial credit
+                elif is_special_subset:
+                    # Special subsets (e.g. TG01/TG30 vs printedTotal 186)
+                    total_score = 90.0
+                elif target_digits.isdigit() and set_digits.isdigit():
+                    try:
+                        t_val = int(target_digits)
+                        s_val = int(set_digits)
+                        if abs(s_val - t_val) <= 2:
+                            total_score = 60.0
+                        elif len(target_digits) == len(set_digits):
+                            diffs = sum(1 for a, b in zip(target_digits, set_digits) if a != b)
+                            if diffs == 1:
+                                total_score = 50.0
+                    except ValueError:
+                        pass
+            elif is_special_subset or not target_total_raw:
+                # Promo cards or subset cards with missing denominator
+                total_score = 80.0
 
             hp_score    = 100.0 if (ocr_hp and card_hp and ocr_hp == card_hp) else (40.0 if not ocr_hp else 0.0)
             name_score  = float(fuzz.partial_ratio(ocr_name.lower(), card_name.lower())) if ocr_name else 50.0
 
-            # Number match score (exact match = 100, suffix/delta match = 70, misread = 0)
+            # Number match score (exact match = 100, suffix/subset match = 80)
             num_score = 0.0
             if num_query:
-                if card_number == num_query:
+                q_clean = num_query.upper().strip()
+                c_clean = card_number.upper().strip()
+                if c_clean == q_clean:
                     num_score = 100.0
-                elif num_query.endswith(card_number) or card_number.endswith(num_query[-2:]):
-                    num_score = 70.0
+                elif c_clean.lstrip("0") == q_clean.lstrip("0") and c_clean.lstrip("0"):
+                    num_score = 100.0
+                elif c_clean.endswith(q_clean) or q_clean.endswith(c_clean):
+                    num_score = 80.0
+
+            # If exact number match on promo/special card, ensure total_score is high
+            if num_score == 100.0 and (is_special_subset or not target_total_raw):
+                total_score = 100.0
 
             # Weighted final score
             final_score = (total_score * 0.40) + (hp_score * 0.20) + (name_score * 0.20) + (num_score * 0.20)

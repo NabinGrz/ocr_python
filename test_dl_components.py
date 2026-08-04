@@ -113,6 +113,23 @@ class TestDLComponents(unittest.TestCase):
         self.assertIn("verified", res)
         self.assertIn("confidence", res)
 
+    def test_special_cards_collector_id(self):
+        """Tests collector ID extraction and parsing for special cards (TG, GG, Promos, SIRs)."""
+        extractor = PokemonCardExtractor(languages=['en'], gpu=False)
+
+        # 1. Trainer Gallery
+        self.assertEqual(extractor.parse_collector_id("ILLUSTRATOR TG01/TG30"), "TG01/TG30")
+        # 2. Galarian Gallery
+        self.assertEqual(extractor.parse_collector_id("SECRET GG12/GG70"), "GG12/GG70")
+        # 3. Promo Cards
+        self.assertEqual(extractor.parse_collector_id("PROMO SVP025"), "SVP025")
+        self.assertEqual(extractor.parse_collector_id("SWSH 050"), "SWSH050")
+        # 4. Secret Rares / SIR (Numerator > Denominator)
+        self.assertEqual(extractor.parse_collector_id("199/165"), "199/165")
+        self.assertEqual(extractor.parse_collector_id("251/198"), "251/198")
+        # 5. Protected valid set total (165 should not become 168)
+        self.assertEqual(extractor._correct_set_total("165"), "165")
+
 
 if __name__ == "__main__":
     unittest.main()
