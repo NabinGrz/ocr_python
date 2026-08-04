@@ -15,10 +15,30 @@ import numpy as np
 import easyocr
 from typing import Dict, Any, Optional, List, Tuple
 
+# Import DL components with graceful fallback handling
+try:
+    from card_detector import get_card_detector, ModelNotAvailableError as YOLONotAvailableError
+except ImportError:
+    get_card_detector = None
+
+try:
+    from frame_quality_classifier import classify_frame_quality, ModelNotAvailableError as QualityModelNotAvailableError
+except ImportError:
+    classify_frame_quality = None
+
 class PokemonCardExtractor:
     def __init__(self, languages=['en'], gpu=False):
         # Initialize EasyOCR reader
         self.reader = easyocr.Reader(languages, gpu=gpu)
+
+        # Initialize YOLO card detector if available
+        if get_card_detector is not None:
+            try:
+                self.yolo_detector = get_card_detector()
+            except Exception:
+                self.yolo_detector = None
+        else:
+            self.yolo_detector = None
 
         # Character confusion map common in OCR
         self.char_fix_map = {
@@ -307,11 +327,28 @@ class PokemonCardExtractor:
 
     def extract_from_image(self, image_np: np.ndarray) -> Dict[str, Any]:
         """
-        Full extraction pipeline: dewarping → ROI crop → enhance → OCR → parse.
-        Uses tight bottom 8% crop for collector ID first; falls back to wide bottom 25% crop if needed.
+        Full extraction pipeline: YOLO / Dewarping → ROI crop → enhance → OCR → parse.
+        Uses YOLO bounding box detections if confident; falls back to contour-based dewarping + percentage crop.
         """
-        warped = self.preprocess_and_warp(image_np)
-        rois = self.crop_rois(warped)
+        warped = None
+        rois = None
+        yolo_used = False
+
+        # Component 1 Layer: Try YOLO Card/Region Detection first
+        if self.yolo_detector is not None and self.yolo_detector.is_available():
+            try:
+                detections = self.yolo_detector.detect_regions(image_np, conf_threshold=0.6)
+                if "card" in detections and detections["card"].confidence >= 0.6:
+                    warped, rois = self.yolo_detector.warp_and_crop(image_np, detections)
+                    yolo_used = True
+            except Exception:
+                warped = None
+                rois = None
+
+        # Fallback to contour-based dewarping & fixed percentage crops if YOLO is absent or low confidence
+        if not yolo_used or warped is None or rois is None:
+            warped = self.preprocess_and_warp(image_np)
+            rois = self.crop_rois(warped)
 
         header_enhanced = self._enhance_roi(rois["header"])
         footer_tight_enhanced = self._enhance_roi(rois["footer_tight"])
@@ -470,25 +507,41 @@ class PokemonCardExtractor:
 
     def assess_frame_quality(self, frame: np.ndarray) -> Dict[str, Any]:
         """
-        Gating check run before full OCR. Rejects frames with severe blur, glare, or missing card contour.
+        Gating check run before full OCR.
+        Evaluates MobileNetV2 DL quality classifier scores and raw heuristics (blur, glare, contour).
         """
         if frame is None or frame.size == 0:
             return {"pass": False, "reason": "Invalid or empty image frame"}
 
+        # 1. MobileNetV2 DL Quality Gate Layer (Component 2)
+        ml_quality_scores = None
+        if classify_frame_quality is not None:
+            try:
+                ml_quality_scores = classify_frame_quality(frame)
+                if ml_quality_scores.get("blurry", 0.0) > 0.70:
+                    return {"pass": False, "reason": "Image is too blurry. Hold steady.", "ml_quality_scores": ml_quality_scores}
+                if ml_quality_scores.get("glare", 0.0) > 0.70:
+                    return {"pass": False, "reason": "Glare detected on card surface. Tilt camera slightly.", "ml_quality_scores": ml_quality_scores}
+                if ml_quality_scores.get("occluded", 0.0) > 0.70:
+                    return {"pass": False, "reason": "Card area partially occluded. Uncover card.", "ml_quality_scores": ml_quality_scores}
+            except Exception:
+                ml_quality_scores = None
+
         h, w = frame.shape[:2]
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # 1. Blurriness Check (Laplacian variance)
+        # 2. Raw Heuristic Quality Checks (Fallback / Run Alongside)
+        # 2a. Blurriness Check (Laplacian variance)
         lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
         if lap_var < 70.0:
-            return {"pass": False, "reason": "Image is too blurry. Hold steady."}
+            return {"pass": False, "reason": "Image is too blurry. Hold steady.", "ml_quality_scores": ml_quality_scores}
 
-        # 2. Glare Check (percentage of clipped bright pixels)
+        # 2b. Glare Check (percentage of clipped bright pixels)
         glare_ratio = (gray > 250).sum() / float(h * w)
         if glare_ratio > 0.08:
-            return {"pass": False, "reason": "Glare detected on card surface. Tilt camera slightly."}
+            return {"pass": False, "reason": "Glare detected on card surface. Tilt camera slightly.", "ml_quality_scores": ml_quality_scores}
 
-        # 3. Contour / Card Presence Check
+        # 2c. Contour / Card Presence Check
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         edged = cv2.Canny(blurred, 50, 200)
         contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -496,9 +549,9 @@ class PokemonCardExtractor:
             largest_area = max(cv2.contourArea(c) for c in contours)
             area_ratio = largest_area / float(h * w)
             if area_ratio < 0.10:
-                return {"pass": False, "reason": "No card detected in frame. Align card inside overlay."}
+                return {"pass": False, "reason": "No card detected in frame. Align card inside overlay.", "ml_quality_scores": ml_quality_scores}
 
-        return {"pass": True, "reason": None}
+        return {"pass": True, "reason": None, "ml_quality_scores": ml_quality_scores}
 
     def process_frame_burst(self, frame_bytes_list: List[bytes], tcg_client) -> Dict[str, Any]:
         """
@@ -564,11 +617,14 @@ class PokemonCardExtractor:
         hp_agreement = (hps.count(modal_hp) / float(passed_count)) if modal_hp and hps else 0.0
         id_agreement = (ids.count(modal_id) / float(passed_count)) if modal_id and ids else 0.0
 
-        # Query database with modal candidates
+        # Query database with modal candidates and visual card matcher
+        first_warped = passed_ocr_results[0].get("warped_card") if passed_ocr_results else None
+
         verification = tcg_client.verify_card(
             collector_id=modal_id,
             ocr_name=modal_name,
-            ocr_hp=modal_hp
+            ocr_hp=modal_hp,
+            card_image=first_warped
         )
 
         db_confidence = verification.get("confidence", 0.0)

@@ -7,8 +7,14 @@ Supports SIR (Special Illustration Rare) cards where card number > set total (e.
 import requests
 import time
 import re
+import numpy as np
 from typing import Optional, Dict, Any, List
 from fuzzywuzzy import fuzz
+
+try:
+    from visual_card_matcher import match_card_by_image, ModelNotAvailableError as VisualMatcherNotAvailableError
+except ImportError:
+    match_card_by_image = None
 
 
 class PokemonTCGClient:
@@ -64,10 +70,23 @@ class PokemonTCGClient:
         collector_id: Optional[str],
         ocr_name: Optional[str] = None,
         ocr_hp: Optional[int] = None,
+        card_image: Optional[np.ndarray] = None,
     ) -> Dict[str, Any]:
         candidates: List[Dict] = []
         target_num_raw = None
         target_total_raw = None
+
+        # Strategy 0 (Component 3 Layer): ResNet Visual Matching in parallel with OCR
+        visual_matches = []
+        top_visual_match = None
+        if card_image is not None and match_card_by_image is not None:
+            try:
+                visual_matches = match_card_by_image(card_image, top_k=5)
+                if visual_matches:
+                    top_visual_match = visual_matches[0]
+            except Exception:
+                visual_matches = []
+                top_visual_match = None
 
         if collector_id and "/" in collector_id:
             target_num_raw, target_total_raw = collector_id.split("/", 1)
@@ -157,6 +176,42 @@ class PokemonTCGClient:
                 best_match = card
                 best_subscores_count = subscores_count
 
+        # Check for disagreement between Visual Match and OCR text match
+        disagreement_warning = None
+        if top_visual_match and top_visual_match.get("similarity_score", 0.0) >= 0.80 and best_match:
+            vis_name = top_visual_match.get("name", "")
+            vis_hp = top_visual_match.get("hp")
+            best_name = best_match.get("name", "")
+            best_hp_str = best_match.get("hp", "0")
+            best_hp = int(best_hp_str) if best_hp_str.isdigit() else None
+
+            # If visual match disagrees with OCR match in name or HP
+            if vis_hp and ocr_hp and abs(vis_hp - ocr_hp) > 30:
+                disagreement_warning = f"Visual candidate '{vis_name}' (HP {vis_hp}) differs from OCR candidate '{best_name}' (HP {ocr_hp})."
+            elif vis_name and ocr_name and fuzz.partial_ratio(vis_name.lower(), ocr_name.lower()) < 40:
+                disagreement_warning = f"Visual candidate '{vis_name}' differs from OCR text '{ocr_name}'."
+
+        # If top visual match has high similarity (>0.85) AND agrees or cross-checks with OCR
+        if top_visual_match and top_visual_match.get("similarity_score", 0.0) >= 0.85 and not disagreement_warning:
+            vis_score = top_visual_match["similarity_score"]
+            return {
+                "verified": True,
+                "confidence": round(float(vis_score), 2),
+                "best_score": round(vis_score * 100.0, 1),
+                "name": top_visual_match.get("name"),
+                "hp": top_visual_match.get("hp"),
+                "collector_id": top_visual_match.get("collector_id"),
+                "set_name": top_visual_match.get("set_name"),
+                "set_series": top_visual_match.get("set_series"),
+                "rarity": top_visual_match.get("rarity", "Unknown"),
+                "image_url": top_visual_match.get("image_url"),
+                "tcgplayer_url": top_visual_match.get("tcgplayer_url"),
+                "market_price": top_visual_match.get("market_price"),
+                "visual_match_applied": True,
+                "visual_similarity": round(float(vis_score), 4),
+                "disagreement_warning": None,
+            }
+
         # Bug 5 Fix: Require best_score >= 45.0 AND at least 2 non-zero sub-scores to prevent weak/false matches
         if best_match and best_score >= 45.0 and best_subscores_count >= 2:
             card_number_str   = str(best_match.get("number", ""))
@@ -177,10 +232,10 @@ class PokemonTCGClient:
                 or (prices.get("1stEditionHolofoil") or {}).get("market")
             )
 
-            return {
+            res = {
                 "verified": True,
                 "confidence": round(min(best_score / 100.0, 1.0), 2),
-                "best_score": round(best_score, 1),  # Bug 5 Fix: Return raw best_score for visibility
+                "best_score": round(best_score, 1),
                 "name": best_match.get("name"),
                 "hp": best_match.get("hp"),
                 "collector_id": formatted_id,
@@ -190,12 +245,27 @@ class PokemonTCGClient:
                 "image_url": best_match.get("images", {}).get("large"),
                 "tcgplayer_url": best_match.get("tcgplayer", {}).get("url"),
                 "market_price": market_price,
+                "visual_match_applied": False,
+                "disagreement_warning": disagreement_warning,
             }
+            if top_visual_match:
+                res["visual_candidate"] = {
+                    "name": top_visual_match.get("name"),
+                    "hp": top_visual_match.get("hp"),
+                    "similarity": round(float(top_visual_match.get("similarity_score", 0.0)), 4)
+                }
+            return res
 
         return {
             "verified": False,
             "match": None,
             "confidence": 0.0,
-            "best_score": round(best_score, 1) if best_score > 0 else 0.0,  # Bug 5 Fix: Expose best_score on failure
+            "best_score": round(best_score, 1) if best_score > 0 else 0.0,
             "message": "No confident database match found.",
+            "disagreement_warning": disagreement_warning,
+            "visual_candidate": {
+                "name": top_visual_match.get("name"),
+                "hp": top_visual_match.get("hp"),
+                "similarity": round(float(top_visual_match.get("similarity_score", 0.0)), 4)
+            } if top_visual_match else None
         }
