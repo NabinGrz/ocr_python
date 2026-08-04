@@ -56,7 +56,8 @@ class PokemonCardExtractor:
 
         for c in contours:
             area = cv2.contourArea(c)
-            if area > (h * w * 0.30) and area < (h * w * 0.95):
+            # Accept card contours taking between 10% and 95% of camera image
+            if area > (h * w * 0.10) and area < (h * w * 0.95):
                 peri = cv2.arcLength(c, True)
                 approx = cv2.approxPolyDP(c, 0.02 * peri, True)
                 if len(approx) == 4:
@@ -65,6 +66,12 @@ class PokemonCardExtractor:
                     dst = np.array([[0, 0], [629, 0], [629, 879], [0, 879]], dtype="float32")
                     M = cv2.getPerspectiveTransform(rect, dst)
                     return cv2.warpPerspective(image, M, (630, 880))
+                else:
+                    # Bounding rect fallback for camera photos with rounded corners or tilted edges
+                    bx, by, bw, bh = cv2.boundingRect(c)
+                    if bw > 100 and bh > 100:
+                        cropped = image[by:by+bh, bx:bx+bw]
+                        return cv2.resize(cropped, (630, 880))
 
         return cv2.resize(image, (630, 880))
 
@@ -82,15 +89,13 @@ class PokemonCardExtractor:
         """
         Crops ROIs for OCR:
         - Header (Name & HP): top 18%
-        - Footer (Collector ID wide): bottom 25%
-        - Footer Tight (Collector ID line): bottom 8% (Bug 3 Fix: tight crop targeting just the ID line)
-        Note: The exact percentage (8%) may need tuning per card layout.
+        - Footer Wide: bottom 25%
+        - Footer Tight (Collector ID line): bottom 12%
         """
         h, w = card_img.shape[:2]
-        header_crop = card_img[0:int(h * 0.12), 0:w]
-        footer_crop = card_img[int(h * 0.18):h, 0:w]
-        # Bug 3 Fix: Second tighter crop for just the collector ID line (bottom ~8% of card)
-        footer_tight_crop = card_img[int(h * 0.92):h, 0:w]
+        header_crop = card_img[0:int(h * 0.18), 0:w]
+        footer_crop = card_img[int(h * 0.75):h, 0:w]
+        footer_tight_crop = card_img[int(h * 0.88):h, 0:w]
 
         return {
             "header": header_crop,
@@ -332,7 +337,7 @@ class PokemonCardExtractor:
         hp = self.parse_hp(header_text)
         name = self._extract_name_by_font_size(header_results)
 
-        # Bug 3 Fix: Try parsing ID from tight crop (bottom 8%) first
+        # Try parsing ID from tight crop (bottom 12%) first
         collector_id = self.parse_collector_id(footer_tight_text)
         raw_footer = footer_tight_text
 
@@ -340,6 +345,21 @@ class PokemonCardExtractor:
         if not collector_id:
             collector_id = self.parse_collector_id(footer_text)
             raw_footer = footer_text
+
+        # Fallback: Run OCR on full warped card if name, hp, or collector_id are missing
+        if not name or not collector_id or not hp:
+            full_enhanced = self._enhance_roi(warped)
+            full_results = self.reader.readtext(full_enhanced, detail=1)
+            full_results.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
+            full_lines = [r[1] for r in full_results]
+            full_text = "\n".join(full_lines)
+
+            if not name:
+                name = self._extract_name_by_font_size(full_results)
+            if not hp:
+                hp = self.parse_hp(full_text)
+            if not collector_id:
+                collector_id = self.parse_collector_id(full_text)
 
         return {
             "name": name,
@@ -447,3 +467,142 @@ class PokemonCardExtractor:
 
         name_tokens.sort(key=lambda x: x["mid_x"])
         return " ".join(t["text"] for t in name_tokens)
+
+    def assess_frame_quality(self, frame: np.ndarray) -> Dict[str, Any]:
+        """
+        Gating check run before full OCR. Rejects frames with severe blur, glare, or missing card contour.
+        """
+        if frame is None or frame.size == 0:
+            return {"pass": False, "reason": "Invalid or empty image frame"}
+
+        h, w = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # 1. Blurriness Check (Laplacian variance)
+        lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        if lap_var < 70.0:
+            return {"pass": False, "reason": "Image is too blurry. Hold steady."}
+
+        # 2. Glare Check (percentage of clipped bright pixels)
+        glare_ratio = (gray > 250).sum() / float(h * w)
+        if glare_ratio > 0.08:
+            return {"pass": False, "reason": "Glare detected on card surface. Tilt camera slightly."}
+
+        # 3. Contour / Card Presence Check
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edged = cv2.Canny(blurred, 50, 200)
+        contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest_area = max(cv2.contourArea(c) for c in contours)
+            area_ratio = largest_area / float(h * w)
+            if area_ratio < 0.10:
+                return {"pass": False, "reason": "No card detected in frame. Align card inside overlay."}
+
+        return {"pass": True, "reason": None}
+
+    def process_frame_burst(self, frame_bytes_list: List[bytes], tcg_client) -> Dict[str, Any]:
+        """
+        Processes a burst of frames, rejecting poor quality frames and computing modal consensus
+        across passed frames to achieve high accuracy.
+        """
+        total_frames = len(frame_bytes_list)
+        if total_frames == 0:
+            return {
+                "success": False,
+                "verified": False,
+                "confidence": 0.0,
+                "capture_confidence": 0.0,
+                "total_frames": 0,
+                "passed_frames": 0,
+                "rejection_reason": "No frames provided",
+                "message": "No frames provided"
+            }
+
+        passed_ocr_results = []
+        rejection_reasons = []
+
+        for f_bytes in frame_bytes_list:
+            nparr = np.frombuffer(f_bytes, np.uint8)
+            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            quality = self.assess_frame_quality(frame)
+
+            if not quality["pass"]:
+                rejection_reasons.append(quality["reason"])
+                continue
+
+            ocr_res = self.extract_from_image(frame)
+            passed_ocr_results.append(ocr_res)
+
+        passed_count = len(passed_ocr_results)
+
+        if passed_count == 0:
+            most_common_reason = (
+                max(set(rejection_reasons), key=rejection_reasons.count)
+                if rejection_reasons else "Poor quality frame"
+            )
+            return {
+                "success": False,
+                "verified": False,
+                "confidence": 0.0,
+                "capture_confidence": 0.0,
+                "total_frames": total_frames,
+                "passed_frames": 0,
+                "rejection_reason": most_common_reason,
+                "message": most_common_reason
+            }
+
+        # Compute modal values across passed OCR results
+        names = [r["name"] for r in passed_ocr_results if r.get("name")]
+        hps = [r["hp"] for r in passed_ocr_results if r.get("hp") is not None]
+        ids = [r["unique_id"] for r in passed_ocr_results if r.get("unique_id")]
+
+        modal_name = max(set(names), key=names.count) if names else None
+        modal_hp = max(set(hps), key=hps.count) if hps else None
+        modal_id = max(set(ids), key=ids.count) if ids else None
+
+        name_agreement = (names.count(modal_name) / float(passed_count)) if modal_name and names else 0.0
+        hp_agreement = (hps.count(modal_hp) / float(passed_count)) if modal_hp and hps else 0.0
+        id_agreement = (ids.count(modal_id) / float(passed_count)) if modal_id and ids else 0.0
+
+        # Query database with modal candidates
+        verification = tcg_client.verify_card(
+            collector_id=modal_id,
+            ocr_name=modal_name,
+            ocr_hp=modal_hp
+        )
+
+        db_confidence = verification.get("confidence", 0.0)
+        quality_ratio = passed_count / float(total_frames)
+
+        # Weighted capture confidence
+        capture_confidence = (
+            quality_ratio * 0.20 +
+            id_agreement * 0.30 +
+            name_agreement * 0.20 +
+            (db_confidence / 100.0 if db_confidence > 1.0 else db_confidence) * 0.30
+        ) * 100.0
+
+        return {
+            "success": True,
+            "verified": verification.get("verified", False),
+            "confidence": db_confidence,
+            "capture_confidence": round(capture_confidence, 2),
+            "total_frames": total_frames,
+            "passed_frames": passed_count,
+            "rejection_reason": None,
+            "name": verification.get("name") or modal_name,
+            "hp": verification.get("hp") or modal_hp,
+            "unique_id": verification.get("collector_id") or modal_id,
+            "set_name": verification.get("set_name"),
+            "set_series": verification.get("set_series"),
+            "rarity": verification.get("rarity", "Unknown"),
+            "image_url": verification.get("image_url"),
+            "tcgplayer_url": verification.get("tcgplayer_url"),
+            "market_price": verification.get("market_price"),
+            "best_score": verification.get("best_score", 0.0),
+            "name_agreement": round(name_agreement, 2),
+            "hp_agreement": round(hp_agreement, 2),
+            "id_agreement": round(id_agreement, 2),
+            "message": verification.get("message")
+        }
+

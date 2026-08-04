@@ -36,11 +36,14 @@ class PokemonTCGClient:
                     headers=self.headers, timeout=timeout
                 )
                 if res.status_code == 200 and res.text.strip():
-                    result = res.json().get("data", [])
-                    self._cache[cache_key] = result
-                    return result
+                    try:
+                        result = res.json().get("data", [])
+                        self._cache[cache_key] = result
+                        return result
+                    except Exception:
+                        pass
                 if res.status_code in (429, 500, 502, 503):
-                    time.sleep(1.5 * (attempt + 1))
+                    time.sleep(1.2 * (attempt + 1))
             except Exception as e:
                 if attempt < 2:
                     time.sleep(1.0 * (attempt + 1))
@@ -84,6 +87,9 @@ class PokemonTCGClient:
                 data = self._safe_get({"q": f'name:"{root_name}"'})
                 if not data:
                     data = self._safe_get({"q": f"name:{root_name}*"})
+                if not data and len(root_name) >= 4:
+                    # Fallback for minor OCR typos (e.g. 'Charizardd' -> search 'Char*')
+                    data = self._safe_get({"q": f"name:{root_name[:4]}*"})
                 candidates.extend(data)
 
         # Strategy 2: Search by Collector Number
