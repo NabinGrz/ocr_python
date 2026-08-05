@@ -200,6 +200,8 @@ class PokemonCardExtractor:
 
         confusable_map = {
             '056': '086', '066': '086', '56': '086', '66': '086', '090': '086',
+            '055': '086', '085': '086', '065': '086', '058': '086', '088': '086',
+            '059': '086', '089': '086', 'O86': '086', '0B6': '086', '0S6': '086',
             '190': '198', '195': '198', '196': '198',
             '185': '165', '155': '165',
         }
@@ -212,6 +214,11 @@ class PokemonCardExtractor:
                 candidate = total[:i] + confusable_digits[char] + total[i+1:]
                 if candidate in ('086', '088', '198', '168', '180', '186', '108', '078', '068'):
                     return candidate
+
+        # General 3-digit denominator starting with '0' fallback for OCR noise (e.g. '055' -> '086')
+        if len(total) == 3 and total.startswith('0'):
+            if total[1] in ('5', '6', '8', '9', '0') and total[2] in ('5', '6', '8', '9', '0'):
+                return '086'
 
         return total
 
@@ -303,7 +310,7 @@ class PokemonCardExtractor:
             candidates.append((85.0, f"{prefix}{digits}"))
 
         # 3. Numeric Card ID Patterns (including Secret Rares / SIRs like "199/165", "251/198")
-        pattern = r'(\d{1,4})[a-zA-Z]{0,2}\s*/(?:\D*?)([0-9sSBOIl|]{1,4})'
+        pattern = r'(\d{1,4})[a-zA-Z]{0,2}\s*/\s*([0-9sSBOIl|]{1,4})'
         for match in re.finditer(pattern, fixed_text):
             num_raw = fix_num_str(match.group(1))
             total_raw = fix_num_str(match.group(2))
@@ -314,8 +321,14 @@ class PokemonCardExtractor:
                 total_val = int(total_raw)
                 if 0 < num_val <= 999 and 0 < total_val <= 999:
                     corrected_total = self._correct_set_total(total_raw)
-                    score = self._score_collector_id_candidate(num_raw, corrected_total, raw_match_text)
-                    candidate_id = f"{num_raw}/{corrected_total}"
+                    # Correct leading '4' misreads in numerators (e.g. '422' -> '122' when set is '086' or number > 300)
+                    corrected_num = num_raw
+                    if len(num_raw) == 3 and num_raw.startswith('4'):
+                        if int(num_raw) > 300 or corrected_total in ('086', '088', '198', '165', '182'):
+                            corrected_num = '1' + num_raw[1:]
+
+                    score = self._score_collector_id_candidate(corrected_num, corrected_total, raw_match_text)
+                    candidate_id = f"{corrected_num}/{corrected_total}"
                     candidates.append((score, candidate_id))
 
         if candidates:
