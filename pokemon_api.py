@@ -21,25 +21,30 @@ class PokemonTCGClient:
     BASE_URL = "https://api.pokemontcg.io/v2/cards"
 
     def __init__(self, api_key: Optional[str] = None):
+        import os
+        if api_key is None:
+            api_key = os.getenv("POKEMON_TCG_API_KEY")
+
+        self.session = requests.Session()
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                           "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
         if api_key:
             self.headers["X-Api-Key"] = api_key
+        self.session.headers.update(self.headers)
         self._cache: Dict[str, List[Dict]] = {}
 
-    def _safe_get(self, params: dict, timeout: int = 10) -> List[Dict]:
-        """Cached API request with exponential backoff on rate-limit errors."""
+    def _safe_get(self, params: dict, timeout: float = 3.0) -> List[Dict]:
+        """Cached API request with connection pooling and fast-fail timeout."""
         cache_key = str(sorted(params.items()))
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        for attempt in range(3):
+        for attempt in range(2):
             try:
-                res = requests.get(
-                    self.BASE_URL, params=params,
-                    headers=self.headers, timeout=timeout
+                res = self.session.get(
+                    self.BASE_URL, params=params, timeout=timeout
                 )
                 if res.status_code == 200 and res.text.strip():
                     try:
@@ -49,10 +54,13 @@ class PokemonTCGClient:
                     except Exception:
                         pass
                 if res.status_code in (429, 500, 502, 503):
-                    time.sleep(1.2 * (attempt + 1))
+                    time.sleep(0.3 * (attempt + 1))
+            except requests.exceptions.Timeout as e:
+                print(f"API timeout ({params}): {e}")
+                break
             except Exception as e:
-                if attempt < 2:
-                    time.sleep(1.0 * (attempt + 1))
+                if attempt < 1:
+                    time.sleep(0.3)
                 else:
                     print(f"API error ({params}): {e}")
         self._cache[cache_key] = []
