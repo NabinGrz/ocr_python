@@ -62,8 +62,27 @@ class PokemonCardExtractor:
         # Valid Pokémon name suffixes (appended to the base name)
         self.name_suffixes = {'ex', 'gx', 'vmax', 'vstar', 'v', 'mega'}
 
-        # Patterns that OCR mistakes "ex" for
-        self.ex_aliases = re.compile(r'[@\*]?[eE][xX3]$|[eE][xX3]$|\bex\b', re.IGNORECASE)
+        # Known valid Pokémon set totals / subset sizes — shared by
+        # _correct_set_total (protection) and _score_collector_id_candidate
+        # (bonus scoring), so both stay in sync.
+        self.known_valid_totals = frozenset({
+            '165', '198', '197', '182', '086', '088', '091', '078', '207', '159',
+            '084', '236', '162', '106', '180', '186', '068', '108', '070',
+            '30', '70', '25', '94', '122',
+        })
+
+        # Exact OCR-confusion strings -> correct total.
+        self.confusable_total_map = {
+            '056': '086', '066': '086', '56': '086', '66': '086', '090': '086',
+            '055': '086', '085': '086', '065': '086', '058': '086',
+            '059': '086', '089': '086', 'O86': '086', '0B6': '086', '0S6': '086',
+            '190': '198', '195': '198', '196': '198',
+            '185': '165', '155': '165',
+        }
+        self.confusable_digit_subs = {'0': '8', '5': '8', '6': '8', '9': '8'}
+        self.total_substitution_targets = frozenset(
+            {'086', '088', '198', '168', '180', '186', '108', '078', '068'}
+        )
 
     def preprocess_and_warp(self, image: np.ndarray) -> np.ndarray:
         h, w = image.shape[:2]
@@ -190,29 +209,18 @@ class PokemonCardExtractor:
         Corrects font-specific digit confusion in collector ID denominators (e.g. '056' -> '086').
         Protects valid known set totals from being corrupted.
         """
-        # Protect known valid Pokémon set totals and subset sizes from being corrupted
-        known_valid_totals = {
-            '165', '198', '197', '182', '086', '088', '091', '078', '207', '159',
-            '084', '236', '162', '106', '180', '186', '068', '108', '070', '30', '70', '25', '94', '122'
-        }
-        if total in known_valid_totals:
+        if total in self.known_valid_totals:
             return total
 
-        confusable_map = {
-            '056': '086', '066': '086', '56': '086', '66': '086', '090': '086',
-            '055': '086', '085': '086', '065': '086', '058': '086', '088': '086',
-            '059': '086', '089': '086', 'O86': '086', '0B6': '086', '0S6': '086',
-            '190': '198', '195': '198', '196': '198',
-            '185': '165', '155': '165',
-        }
-        if total in confusable_map:
-            return confusable_map[total]
+        corrected = self.confusable_total_map.get(total)
+        if corrected is not None:
+            return corrected
 
-        confusable_digits = {'0': '8', '5': '8', '6': '8', '9': '8'}
         for i, char in enumerate(total):
-            if char in confusable_digits:
-                candidate = total[:i] + confusable_digits[char] + total[i+1:]
-                if candidate in ('086', '088', '198', '168', '180', '186', '108', '078', '068'):
+            repl = self.confusable_digit_subs.get(char)
+            if repl is not None:
+                candidate = total[:i] + repl + total[i + 1:]
+                if candidate in self.total_substitution_targets:
                     return candidate
 
         # General 3-digit denominator starting with '0' fallback for OCR noise (e.g. '055' -> '086')
@@ -265,7 +273,7 @@ class PokemonCardExtractor:
             score += 25.0
 
         # Known set totals or common denominators get bonus
-        if total_str in ('086', '198', '165', '091', '190', '084', '236', '162', '106', '078', '088', '182', '30', '70', '25'):
+        if total_str in self.known_valid_totals:
             score += 20.0
 
         return score
@@ -442,7 +450,7 @@ class PokemonCardExtractor:
             "footer_raw_ocr": raw_footer,
             "warped_card": warped,
             "header_crop": rois["header"],
-            "footer_crop": rois["footer_tight"] if collector_id and self.parse_collector_id(footer_tight_text) else rois["footer"],
+            "footer_crop": rois["footer_tight"] if raw_footer == footer_tight_text else rois["footer"],
         }
 
     def _is_plausible_name_token(self, text: str) -> bool:
