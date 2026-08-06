@@ -48,8 +48,13 @@ if image_np is not None:
         hp = extraction_result["hp"]
         collector_id = extraction_result["unique_id"]
 
-        # Step 2: Query Pokemon TCG API for 99.9% verification
-        verification = api_client.verify_card(collector_id=collector_id, ocr_name=name, ocr_hp=hp)
+        # Step 2: Cross-check OCR evidence against the local/API card catalog
+        verification = api_client.verify_card(
+            collector_id=collector_id,
+            ocr_name=name,
+            ocr_hp=hp,
+            card_image=extraction_result.get("warped_card"),
+        )
 
     with col_results:
         st.subheader("2. Extracted Card Data (OCR Engine)")
@@ -63,7 +68,7 @@ if image_np is not None:
             st.metric("Unique ID", collector_id if collector_id else "Not Detected")
 
         st.markdown("---")
-        st.subheader("3. Database Verified Card (99.9% Accuracy)")
+        st.subheader("3. Database Cross-Checked Card")
 
         if verification.get("verified"):
             st.success(f"✅ Exact Match Verified (Confidence: {int(verification['confidence']*100)}%)")

@@ -10,9 +10,13 @@ Supports:
 """
 
 import re
+import json
+import os
 import cv2
 import numpy as np
 import easyocr
+from collections import Counter
+from difflib import SequenceMatcher
 from typing import Dict, Any, Optional, List, Tuple
 
 # Import DL components with graceful fallback handling
@@ -65,11 +69,25 @@ class PokemonCardExtractor:
         # Known valid Pokémon set totals / subset sizes — shared by
         # _correct_set_total (protection) and _score_collector_id_candidate
         # (bonus scoring), so both stay in sync.
-        self.known_valid_totals = frozenset({
+        built_in_totals = {
             '165', '198', '197', '182', '086', '088', '091', '078', '207', '159',
             '084', '236', '162', '106', '180', '186', '068', '108', '070',
             '30', '70', '25', '94', '122',
-        })
+        }
+        catalog_path = "models/card_catalog.json"
+        if os.path.exists(catalog_path):
+            try:
+                with open(catalog_path, "r", encoding="utf-8") as source:
+                    catalog = json.load(source)
+                catalog_cards = catalog.get("cards", []) if isinstance(catalog, dict) else catalog
+                built_in_totals.update(
+                    str(card.get("set", {}).get("printedTotal"))
+                    for card in catalog_cards
+                    if card.get("set", {}).get("printedTotal") is not None
+                )
+            except Exception:
+                pass
+        self.known_valid_totals = frozenset(built_in_totals)
 
         # Exact OCR-confusion strings -> correct total.
         self.confusable_total_map = {
@@ -171,6 +189,83 @@ class PokemonCardExtractor:
 
         return cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
 
+    def _ocr_variants(
+        self,
+        roi: np.ndarray,
+        allowlist: Optional[str] = None,
+    ) -> List[List[Tuple]]:
+        """Run complementary OCR passes so one preprocessing choice cannot dominate."""
+        if roi is None or roi.size == 0:
+            return []
+
+        upscaled = cv2.resize(
+            roi,
+            (roi.shape[1] * 2, roi.shape[0] * 2),
+            interpolation=cv2.INTER_CUBIC,
+        )
+        enhanced = self._enhance_roi(roi)
+        variants = [enhanced, upscaled]
+        results = []
+
+        for variant in variants:
+            kwargs = {
+                "detail": 1,
+                "decoder": "beamsearch",
+                "beamWidth": 5,
+                "paragraph": False,
+            }
+            if allowlist:
+                kwargs["allowlist"] = allowlist
+            ocr_result = self.reader.readtext(variant, **kwargs)
+            ocr_result.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
+            results.append(ocr_result)
+
+        return results
+
+    @staticmethod
+    def _modal_value(values: List[Any]) -> Optional[Any]:
+        """Return a deterministic mode while preserving first-seen tie-breaking."""
+        if not values:
+            return None
+        counts = Counter(values)
+        best_count = max(counts.values())
+        return next(value for value in values if counts[value] == best_count)
+
+    @staticmethod
+    def _fuzzy_name_consensus(names: List[str]) -> Tuple[Optional[str], float]:
+        """Choose the name most similar to all observations and report fuzzy agreement."""
+        if not names:
+            return None, 0.0
+        if len(names) == 1:
+            return names[0], 1.0
+
+        def normalized(value: str) -> str:
+            return re.sub(r"[^a-z]", "", value.lower())
+
+        similarities = []
+        for candidate in names:
+            candidate_norm = normalized(candidate)
+            mean_similarity = sum(
+                SequenceMatcher(None, candidate_norm, normalized(other)).ratio()
+                for other in names
+            ) / len(names)
+            similarities.append(mean_similarity)
+
+        best_index = max(
+            range(len(names)),
+            key=lambda idx: (
+                similarities[idx],
+                bool(re.search(r"\s(?:ex|gx|v|vmax|vstar)$", names[idx], re.IGNORECASE)),
+            ),
+        )
+        consensus = names[best_index]
+        consensus_norm = normalized(consensus)
+        agreeing = sum(
+            SequenceMatcher(None, consensus_norm, normalized(other)).ratio() >= 0.78
+            for other in names
+        )
+        return consensus, agreeing / float(len(names))
+
     def parse_hp(self, text: str) -> Optional[int]:
         """
         Extracts HP from header text. HP in Pokémon TCG is ALWAYS a multiple of 10 (30-400 HP).
@@ -222,11 +317,6 @@ class PokemonCardExtractor:
                 candidate = total[:i] + repl + total[i + 1:]
                 if candidate in self.total_substitution_targets:
                     return candidate
-
-        # General 3-digit denominator starting with '0' fallback for OCR noise (e.g. '055' -> '086')
-        if len(total) == 3 and total.startswith('0'):
-            if total[1] in ('5', '6', '8', '9', '0') and total[2] in ('5', '6', '8', '9', '0'):
-                return '086'
 
         return total
 
@@ -394,53 +484,64 @@ class PokemonCardExtractor:
             warped = self.preprocess_and_warp(image_np)
             rois = self.crop_rois(warped)
 
-        header_enhanced = self._enhance_roi(rois["header"])
-        footer_tight_enhanced = self._enhance_roi(rois["footer_tight"])
-        footer_enhanced = self._enhance_roi(rois["footer"])
+        id_allowlist = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz/-| "
+        header_variants = self._ocr_variants(rois["header"])
+        footer_tight_variants = self._ocr_variants(rois["footer_tight"], id_allowlist)
+        footer_variants = self._ocr_variants(rois["footer"], id_allowlist)
 
-        header_results = self.reader.readtext(header_enhanced, detail=1)
-        footer_tight_results = self.reader.readtext(footer_tight_enhanced, detail=1)
-        footer_results = self.reader.readtext(footer_enhanced, detail=1)
+        header_texts = ["\n".join(r[1] for r in results) for results in header_variants]
+        footer_tight_texts = ["\n".join(r[1] for r in results) for results in footer_tight_variants]
+        footer_texts = [
+            "\n".join(r[1] for r in sorted(results, key=lambda r: r[0][0][1], reverse=True))
+            for results in footer_variants
+        ]
 
-        header_results.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
-        footer_tight_results.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
-        footer_results.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
+        name_candidates = [
+            candidate
+            for candidate in (self._extract_name_by_font_size(results) for results in header_variants)
+            if candidate
+        ]
+        hp_candidates = [
+            candidate for candidate in (self.parse_hp(text) for text in header_texts) if candidate is not None
+        ]
 
-        header_lines = [r[1] for r in header_results]
-        footer_tight_lines = [r[1] for r in footer_tight_results]
-        footer_results_bottom_first = sorted(footer_results, key=lambda r: r[0][0][1], reverse=True)
-        footer_lines = [r[1] for r in footer_results_bottom_first]
+        name, _ = self._fuzzy_name_consensus(name_candidates)
+        hp = self._modal_value(hp_candidates)
+        header_text = "\n--- OCR PASS ---\n".join(header_texts)
 
-        header_text = "\n".join(header_lines)
-        footer_tight_text = "\n".join(footer_tight_lines)
-        footer_text = "\n".join(footer_lines)
+        # Prefer IDs that repeat across preprocessing and crop variants.
+        id_observations = []
+        for text in footer_tight_texts + footer_texts:
+            candidate = self.parse_collector_id(text)
+            if candidate:
+                id_observations.append(candidate)
+        collector_id = self._modal_value(id_observations)
 
-        hp = self.parse_hp(header_text)
-        name = self._extract_name_by_font_size(header_results)
-
-        # Try parsing ID from tight crop (bottom 12%) first
-        collector_id = self.parse_collector_id(footer_tight_text)
-        raw_footer = footer_tight_text
-
-        # Fall back to wide footer crop (bottom 25%) if tight crop yields no match
-        if not collector_id:
-            collector_id = self.parse_collector_id(footer_text)
-            raw_footer = footer_text
+        tight_ids = [self.parse_collector_id(text) for text in footer_tight_texts]
+        tight_ids = [candidate for candidate in tight_ids if candidate]
+        use_tight_footer = bool(collector_id and collector_id in tight_ids)
+        raw_footer = "\n--- OCR PASS ---\n".join(
+            footer_tight_texts if use_tight_footer else footer_texts
+        )
 
         # Fallback: Run OCR on full warped card if name, hp, or collector_id are missing
         if not name or not collector_id or not hp:
-            full_enhanced = self._enhance_roi(warped)
-            full_results = self.reader.readtext(full_enhanced, detail=1)
-            full_results.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
-            full_lines = [r[1] for r in full_results]
-            full_text = "\n".join(full_lines)
+            full_variants = self._ocr_variants(warped)
+            full_texts = ["\n".join(r[1] for r in results) for results in full_variants]
 
             if not name:
-                name = self._extract_name_by_font_size(full_results)
+                full_names = [
+                    candidate
+                    for candidate in (self._extract_name_by_font_size(results) for results in full_variants)
+                    if candidate
+                ]
+                name = self._modal_value(full_names)
             if not hp:
-                hp = self.parse_hp(full_text)
+                full_hps = [self.parse_hp(text) for text in full_texts]
+                hp = self._modal_value([candidate for candidate in full_hps if candidate is not None])
             if not collector_id:
-                collector_id = self.parse_collector_id(full_text)
+                full_ids = [self.parse_collector_id(text) for text in full_texts]
+                collector_id = self._modal_value([candidate for candidate in full_ids if candidate])
 
         return {
             "name": name,
@@ -450,7 +551,10 @@ class PokemonCardExtractor:
             "footer_raw_ocr": raw_footer,
             "warped_card": warped,
             "header_crop": rois["header"],
-            "footer_crop": rois["footer_tight"] if raw_footer == footer_tight_text else rois["footer"],
+            "footer_crop": rois["footer_tight"] if use_tight_footer else rois["footer"],
+            "ocr_name_candidates": name_candidates,
+            "ocr_hp_candidates": hp_candidates,
+            "ocr_id_candidates": id_observations,
         }
 
     def _is_plausible_name_token(self, text: str) -> bool:
@@ -557,45 +661,105 @@ class PokemonCardExtractor:
         if frame is None or frame.size == 0:
             return {"pass": False, "reason": "Invalid or empty image frame"}
 
-        # 1. MobileNetV2 DL Quality Gate Layer (Component 2)
+        h, w = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # Raw measurements are intentionally computed before the learned model.
+        # The bundled classifier is trained on synthetic degradations, so it is
+        # useful corroborating evidence but not reliable enough to be a sole gate.
+        lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        glare_ratio = float((gray > 250).sum() / float(h * w))
+
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edged = cv2.Canny(blurred, 50, 200)
+        contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        largest_area = max((cv2.contourArea(c) for c in contours), default=0.0)
+        area_ratio = float(largest_area / float(h * w))
+        normalized_aspect = min(w, h) / float(max(w, h))
+        full_frame_card_like = 0.62 <= normalized_aspect <= 0.80
+
+        # 1. MobileNetV2 quality evidence (Component 2)
         ml_quality_scores = None
         if classify_frame_quality is not None:
             try:
                 ml_quality_scores = classify_frame_quality(frame)
-                if ml_quality_scores.get("blurry", 0.0) > 0.70:
-                    return {"pass": False, "reason": "Image is too blurry. Hold steady.", "ml_quality_scores": ml_quality_scores}
-                if ml_quality_scores.get("glare", 0.0) > 0.70:
-                    return {"pass": False, "reason": "Glare detected on card surface. Tilt camera slightly.", "ml_quality_scores": ml_quality_scores}
-                if ml_quality_scores.get("occluded", 0.0) > 0.70:
-                    return {"pass": False, "reason": "Card area partially occluded. Uncover card.", "ml_quality_scores": ml_quality_scores}
             except Exception:
                 ml_quality_scores = None
 
-        h, w = frame.shape[:2]
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        metrics = {
+            "laplacian_variance": round(lap_var, 2),
+            "glare_ratio": round(glare_ratio, 4),
+            "card_area_ratio": round(area_ratio, 4),
+            "full_frame_card_like": full_frame_card_like,
+        }
 
-        # 2. Raw Heuristic Quality Checks (Fallback / Run Alongside)
-        # 2a. Blurriness Check (Laplacian variance)
-        lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        # 2. Hard gates require measurable image evidence. Learned predictions
+        # only tighten borderline decisions when they agree with the heuristics.
         if lap_var < 70.0:
-            return {"pass": False, "reason": "Image is too blurry. Hold steady.", "ml_quality_scores": ml_quality_scores}
+            return {
+                "pass": False,
+                "reason": "Image is too blurry. Hold steady.",
+                "ml_quality_scores": ml_quality_scores,
+                "metrics": metrics,
+                "quality_score": 0.0,
+            }
+        if (
+            ml_quality_scores
+            and ml_quality_scores.get("blurry", 0.0) > 0.90
+            and lap_var < 140.0
+        ):
+            return {
+                "pass": False,
+                "reason": "Image is probably blurry. Hold steady.",
+                "ml_quality_scores": ml_quality_scores,
+                "metrics": metrics,
+                "quality_score": 0.0,
+            }
 
-        # 2b. Glare Check (percentage of clipped bright pixels)
-        glare_ratio = (gray > 250).sum() / float(h * w)
         if glare_ratio > 0.08:
-            return {"pass": False, "reason": "Glare detected on card surface. Tilt camera slightly.", "ml_quality_scores": ml_quality_scores}
+            return {
+                "pass": False,
+                "reason": "Glare detected on card surface. Tilt camera slightly.",
+                "ml_quality_scores": ml_quality_scores,
+                "metrics": metrics,
+                "quality_score": 0.0,
+            }
+        if (
+            ml_quality_scores
+            and ml_quality_scores.get("glare", 0.0) > 0.95
+            and glare_ratio > 0.03
+        ):
+            return {
+                "pass": False,
+                "reason": "Image probably contains glare. Tilt camera slightly.",
+                "ml_quality_scores": ml_quality_scores,
+                "metrics": metrics,
+                "quality_score": 0.0,
+            }
 
-        # 2c. Contour / Card Presence Check
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        edged = cv2.Canny(blurred, 50, 200)
-        contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            largest_area = max(cv2.contourArea(c) for c in contours)
-            area_ratio = largest_area / float(h * w)
-            if area_ratio < 0.10:
-                return {"pass": False, "reason": "No card detected in frame. Align card inside overlay.", "ml_quality_scores": ml_quality_scores}
+        if area_ratio < 0.10 and not full_frame_card_like:
+            return {
+                "pass": False,
+                "reason": "No card detected in frame. Align card inside overlay.",
+                "ml_quality_scores": ml_quality_scores,
+                "metrics": metrics,
+                "quality_score": 0.0,
+            }
 
-        return {"pass": True, "reason": None, "ml_quality_scores": ml_quality_scores}
+        sharpness_score = min(lap_var / 350.0, 1.0)
+        glare_score = max(0.0, 1.0 - glare_ratio / 0.08)
+        presence_score = 1.0 if full_frame_card_like else min(area_ratio / 0.45, 1.0)
+        quality_score = 100.0 * (
+            sharpness_score * 0.45 + glare_score * 0.30 + presence_score * 0.25
+        )
+
+        return {
+            "pass": True,
+            "reason": None,
+            "ml_quality_scores": ml_quality_scores,
+            "metrics": metrics,
+            "quality_score": round(quality_score, 2),
+        }
 
     def process_frame_burst(self, frame_bytes_list: List[bytes], tcg_client) -> Dict[str, Any]:
         """
@@ -628,6 +792,7 @@ class PokemonCardExtractor:
                 continue
 
             ocr_res = self.extract_from_image(frame)
+            ocr_res["frame_quality_score"] = quality.get("quality_score", 0.0)
             passed_ocr_results.append(ocr_res)
 
         passed_count = len(passed_ocr_results)
@@ -653,22 +818,29 @@ class PokemonCardExtractor:
         hps = [r["hp"] for r in passed_ocr_results if r.get("hp") is not None]
         ids = [r["unique_id"] for r in passed_ocr_results if r.get("unique_id")]
 
-        modal_name = max(set(names), key=names.count) if names else None
-        modal_hp = max(set(hps), key=hps.count) if hps else None
-        modal_id = max(set(ids), key=ids.count) if ids else None
+        modal_name, fuzzy_name_agreement = self._fuzzy_name_consensus(names)
+        modal_hp = self._modal_value(hps)
+        modal_id = self._modal_value(ids)
 
-        name_agreement = (names.count(modal_name) / float(passed_count)) if modal_name and names else 0.0
+        name_agreement = (
+            fuzzy_name_agreement * (len(names) / float(passed_count)) if modal_name else 0.0
+        )
         hp_agreement = (hps.count(modal_hp) / float(passed_count)) if modal_hp and hps else 0.0
         id_agreement = (ids.count(modal_id) / float(passed_count)) if modal_id and ids else 0.0
 
-        # Query database with modal candidates and visual card matcher
-        first_warped = passed_ocr_results[0].get("warped_card") if passed_ocr_results else None
+        # Query using the sharpest/cleanest accepted frame, rather than whichever
+        # frame happened to arrive first.
+        best_frame_result = max(
+            passed_ocr_results,
+            key=lambda result: result.get("frame_quality_score", 0.0),
+        )
+        best_warped = best_frame_result.get("warped_card")
 
         verification = tcg_client.verify_card(
             collector_id=modal_id,
             ocr_name=modal_name,
             ocr_hp=modal_hp,
-            card_image=first_warped
+            card_image=best_warped
         )
 
         db_confidence = verification.get("confidence", 0.0)
@@ -676,9 +848,10 @@ class PokemonCardExtractor:
 
         # Weighted capture confidence
         capture_confidence = (
-            quality_ratio * 0.20 +
+            quality_ratio * 0.15 +
             id_agreement * 0.30 +
-            name_agreement * 0.20 +
+            name_agreement * 0.15 +
+            hp_agreement * 0.10 +
             (db_confidence / 100.0 if db_confidence > 1.0 else db_confidence) * 0.30
         ) * 100.0
 
@@ -703,6 +876,6 @@ class PokemonCardExtractor:
             "name_agreement": round(name_agreement, 2),
             "hp_agreement": round(hp_agreement, 2),
             "id_agreement": round(id_agreement, 2),
+            "candidates": verification.get("candidates"),
             "message": verification.get("message")
         }
-

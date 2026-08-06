@@ -3,7 +3,7 @@ FastAPI REST Server for Pokémon TCG OCR & Card Identification
 Exposes API endpoints for consumption by Flutter Mobile App.
 """
 
-import io
+import asyncio
 import time
 import cv2
 import logging
@@ -12,6 +12,7 @@ from typing import Optional, Dict, Any, List
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 from pokemon_card_ocr import PokemonCardExtractor
 from pokemon_api import PokemonTCGClient
 
@@ -67,6 +68,10 @@ async def log_requests_middleware(request: Request, call_next):
 # Global singleton instances
 ocr_extractor = PokemonCardExtractor()
 tcg_client = PokemonTCGClient()
+inference_lock = asyncio.Lock()
+
+MAX_IMAGE_BYTES = 15 * 1024 * 1024
+MAX_BURST_FRAMES = 20
 
 
 class CardCandidate(BaseModel):
@@ -136,16 +141,26 @@ async def scan_card_stream(files: List[UploadFile] = File(...)):
     if not files:
         logger.warning("⚠️ [/api/v1/scan/stream] No files provided in burst stream")
         raise HTTPException(status_code=400, detail="No files provided in burst stream.")
+    if len(files) > MAX_BURST_FRAMES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"At most {MAX_BURST_FRAMES} frames are allowed per burst.",
+        )
 
     try:
         frame_bytes_list = []
         for file in files:
             content = await file.read()
+            if len(content) > MAX_IMAGE_BYTES:
+                raise HTTPException(status_code=413, detail="An uploaded frame is too large.")
             if content:
                 frame_bytes_list.append(content)
 
         logger.info("🔍 [/api/v1/scan/stream] Processing burst stream (%d non-empty frames)...", len(frame_bytes_list))
-        result_dict = ocr_extractor.process_frame_burst(frame_bytes_list, tcg_client)
+        async with inference_lock:
+            result_dict = await run_in_threadpool(
+                ocr_extractor.process_frame_burst, frame_bytes_list, tcg_client
+            )
 
         raw_candidates = result_dict.get("candidates")
         cand_models = [CardCandidate(**c) for c in raw_candidates] if raw_candidates else None
@@ -187,6 +202,8 @@ async def scan_card_stream(files: List[UploadFile] = File(...)):
             message=result_dict.get("message")
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         elapsed_ms = (time.time() - start_time) * 1000.0
         logger.error("❌ [/api/v1/scan/stream] Stream processing error after %.2f ms: %s", elapsed_ms, str(e), exc_info=True)
@@ -214,6 +231,8 @@ async def scan_card(file: UploadFile = File(...)):
 
     try:
         contents = await file.read()
+        if len(contents) > MAX_IMAGE_BYTES:
+            raise HTTPException(status_code=413, detail="Uploaded image is too large.")
         file_size_kb = len(contents) / 1024.0
         logger.info("   [1/3 Load Image] File size: %.2f KB", file_size_kb)
 
@@ -230,8 +249,9 @@ async def scan_card(file: UploadFile = File(...)):
         # 1. OCR Extraction
         logger.info("   [2/3 OCR Pipeline] Running OpenCV crop & EasyOCR text extraction...")
         ocr_start = time.time()
-        ocr_result = ocr_extractor.extract_from_image(image_np)
-        ocr_ms = (time.time() - ocr_start) * 1000.0
+        async with inference_lock:
+            ocr_result = await run_in_threadpool(ocr_extractor.extract_from_image, image_np)
+            ocr_ms = (time.time() - ocr_start) * 1000.0
 
         extracted_name = ocr_result.get("name")
         extracted_hp = ocr_result.get("hp")
@@ -242,12 +262,14 @@ async def scan_card(file: UploadFile = File(...)):
         # 2. Database Verification
         logger.info("   [3/3 DB Verification] Querying Pokémon card database snapshot & scoring candidates...")
         verify_start = time.time()
-        verification = tcg_client.verify_card(
-            collector_id=extracted_id,
-            ocr_name=extracted_name,
-            ocr_hp=extracted_hp,
-            card_image=ocr_result.get("warped_card")
-        )
+        async with inference_lock:
+            verification = await run_in_threadpool(
+                tcg_client.verify_card,
+                extracted_id,
+                extracted_name,
+                extracted_hp,
+                ocr_result.get("warped_card"),
+            )
         verify_ms = (time.time() - verify_start) * 1000.0
 
         verified = verification.get("verified", False)
@@ -285,6 +307,8 @@ async def scan_card(file: UploadFile = File(...)):
             message=verification.get("message")
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         total_ms = (time.time() - start_time) * 1000.0
         logger.error("❌ [/api/v1/scan] Processing error for '%s' after %.2f ms: %s", filename, total_ms, str(e), exc_info=True)

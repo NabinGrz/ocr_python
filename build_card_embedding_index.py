@@ -77,7 +77,7 @@ def build_index(
     metadata = []
 
     # Include local sample image if available
-    sample_path = "sample_charizard.png"
+    sample_path = "sample_mew.png"
     if os.path.exists(sample_path):
         sample_img = cv2.imread(sample_path)
         if sample_img is not None:
@@ -90,14 +90,15 @@ def build_index(
                 feat = feat / norm
             embeddings.append(feat)
             metadata.append({
-                "card_id": "sv3pt5-199",
-                "collector_id": "199/165",
-                "name": "Charizard ex",
-                "hp": 330,
+                "card_id": "sv3pt5-151",
+                "collector_id": "151/165",
+                "name": "Mew ex",
+                "hp": 180,
                 "set_name": "151",
                 "set_series": "Scarlet & Violet",
-                "rarity": "Special Illustration Rare",
-                "image_url": "sample_charizard.png"
+                "rarity": "Double Rare",
+                "image_url": "sample_mew.png",
+                "embedding": feat.tolist(),
             })
 
     for card in cards_data:

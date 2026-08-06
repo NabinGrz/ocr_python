@@ -49,11 +49,9 @@ class FrameQualityClassifier:
                 class MobileNetV2QualityModel(nn.Module):
                     def __init__(self, num_classes=4):
                         super().__init__()
-                        try:
-                            from torchvision.models import MobileNet_V2_Weights
-                            self.backbone = models.mobilenet_v2(weights=MobileNet_V2_Weights.DEFAULT)
-                        except Exception:
-                            self.backbone = models.mobilenet_v2(pretrained=True)
+                        # The checkpoint contains the complete backbone. Avoid a
+                        # redundant network download before loading local weights.
+                        self.backbone = models.mobilenet_v2(weights=None)
                         in_features = self.backbone.classifier[1].in_features
                         self.backbone.classifier = nn.Sequential(
                             nn.Dropout(0.3),

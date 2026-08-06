@@ -83,7 +83,7 @@ def create_synthetic_base_card() -> np.ndarray:
     return canvas
 
 def generate_synthetic_dataset(num_samples: int = 150) -> Tuple[List[np.ndarray], np.ndarray]:
-    sample_path = "sample_charizard.png"
+    sample_path = "sample_mew.png"
     if os.path.exists(sample_path):
         base_img = cv2.imread(sample_path)
     else:

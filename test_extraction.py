@@ -1,6 +1,6 @@
 """
 CLI Test Runner for Pokemon Card High-Accuracy Extraction
-Downloads sample card image (Charizard ex) and tests extraction + API verification.
+Uses a sample Mew ex card image and tests extraction + API verification.
 """
 
 import os
@@ -16,7 +16,7 @@ def main():
     print("=" * 60)
 
     sample_url = "https://images.pokemontcg.io/sv3pt5/151_hires.png"
-    img_path = "sample_charizard.png"
+    img_path = "sample_mew.png"
 
     if not os.path.exists(img_path):
         print(f"Downloading sample card image from {sample_url}...")

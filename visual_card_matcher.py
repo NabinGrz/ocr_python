@@ -36,8 +36,11 @@ class VisualCardMatcher:
         self.device = None
         self.transform = None
 
-        self._load_resnet_model()
         self._load_index_and_metadata()
+        # Avoid loading/downloading a large backbone when there is no searchable
+        # card catalog. Matching cannot succeed without metadata.
+        if self.metadata:
+            self._load_resnet_model()
 
     def _load_resnet_model(self) -> None:
         """Loads pretrained ResNet50 feature extractor (outputting 2048-dim vectors)."""
@@ -87,6 +90,13 @@ class VisualCardMatcher:
             except Exception as e:
                 print(f"[VisualCardMatcher] Failed to read FAISS index '{self.index_path}': {e}")
                 self.index = None
+
+        if self.index is not None and self.index.ntotal != len(self.metadata):
+            print(
+                "[VisualCardMatcher] FAISS index/metadata size mismatch; "
+                "falling back to metadata embeddings."
+            )
+            self.index = None
 
     def is_available(self) -> bool:
         """Returns True if both ResNet50 backbone and embedding index are loaded."""
@@ -163,15 +173,15 @@ class VisualCardMatcher:
             return results
 
         # 2. NumPy Cosine Similarity Search Fallback
-        cached_embeddings = [m.get("embedding") for m in self.metadata if "embedding" in m]
-        if cached_embeddings:
-            matrix = np.array(cached_embeddings, dtype=np.float32)
+        embedded_metadata = [m for m in self.metadata if m.get("embedding") is not None]
+        if embedded_metadata:
+            matrix = np.array([m["embedding"] for m in embedded_metadata], dtype=np.float32)
             scores = np.dot(matrix, query_vector)
             top_indices = np.argsort(scores)[::-1][:top_k]
 
             results = []
             for idx in top_indices:
-                meta = {k: v for k, v in self.metadata[idx].items() if k != "embedding"}
+                meta = {k: v for k, v in embedded_metadata[idx].items() if k != "embedding"}
                 meta["similarity_score"] = round(float(scores[idx]), 4)
                 results.append(meta)
             return results

@@ -7,6 +7,8 @@ Supports SIR (Special Illustration Rare) cards where card number > set total (e.
 import requests
 import time
 import re
+import json
+import os
 import numpy as np
 from typing import Optional, Dict, Any, List
 from fuzzywuzzy import fuzz
@@ -20,8 +22,11 @@ except ImportError:
 class PokemonTCGClient:
     BASE_URL = "https://api.pokemontcg.io/v2/cards"
 
-    def __init__(self, api_key: Optional[str] = None):
-        import os
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        catalog_path: str = "models/card_catalog.json",
+    ):
         if api_key is None:
             api_key = os.getenv("POKEMON_TCG_API_KEY")
 
@@ -34,14 +39,86 @@ class PokemonTCGClient:
             self.headers["X-Api-Key"] = api_key
         self.session.headers.update(self.headers)
         self._cache: Dict[str, List[Dict]] = {}
+        self.catalog_path = catalog_path
+        self._local_cards: List[Dict] = []
+        self._cards_by_number: Dict[str, List[Dict]] = {}
+        self._cards_by_name: Dict[str, List[Dict]] = {}
+        self._load_local_catalog()
 
-    def _safe_get(self, params: dict, timeout: float = 3.0) -> List[Dict]:
-        """Cached API request with connection pooling and fast-fail timeout."""
+    @staticmethod
+    def _number_keys(value: str) -> List[str]:
+        raw = str(value or "").upper().strip()
+        if not raw:
+            return []
+        keys = {raw, raw.lstrip("0") or "0"}
+        digits = re.sub(r"\D", "", raw)
+        if digits:
+            keys.update({digits, digits.lstrip("0") or "0"})
+        return list(keys)
+
+    def _load_local_catalog(self) -> None:
+        if not os.path.exists(self.catalog_path):
+            return
+        try:
+            with open(self.catalog_path, "r", encoding="utf-8") as source:
+                payload = json.load(source)
+            self._local_cards = payload.get("cards", payload) if isinstance(payload, dict) else payload
+            for card in self._local_cards:
+                for key in self._number_keys(card.get("number", "")):
+                    self._cards_by_number.setdefault(key, []).append(card)
+                root_name = self._extract_root_name(str(card.get("name", ""))).lower()
+                if root_name:
+                    self._cards_by_name.setdefault(root_name, []).append(card)
+        except Exception as exc:
+            print(f"Local card catalog could not be loaded: {exc}")
+            self._local_cards = []
+            self._cards_by_number = {}
+            self._cards_by_name = {}
+
+    def _search_local_catalog(
+        self,
+        ocr_name: Optional[str],
+        num_query: Optional[str],
+    ) -> List[Dict]:
+        """Return a compact union of number and fuzzy-name candidates."""
+        if not self._local_cards:
+            return []
+
+        matches: Dict[str, Dict] = {}
+        if num_query:
+            for key in self._number_keys(num_query):
+                for card in self._cards_by_number.get(key, []):
+                    matches[str(card.get("id"))] = card
+
+        if ocr_name:
+            root_name = self._extract_root_name(ocr_name).lower()
+            exact_name_cards = self._cards_by_name.get(root_name, [])
+            if exact_name_cards:
+                for card in exact_name_cards:
+                    matches[str(card.get("id"))] = card
+            elif root_name:
+                ranked_names = sorted(
+                    (
+                        (fuzz.ratio(root_name, known_name), known_name)
+                        for known_name in self._cards_by_name
+                    ),
+                    reverse=True,
+                )[:8]
+                for score, known_name in ranked_names:
+                    if score < 65:
+                        continue
+                    for card in self._cards_by_name[known_name]:
+                        matches[str(card.get("id"))] = card
+
+        return list(matches.values())
+
+    def _safe_get(self, params: dict, timeout: float = 5.0) -> List[Dict]:
+        """Cached API request with pooling; transient failures are never cached."""
         cache_key = str(sorted(params.items()))
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 res = self.session.get(
                     self.BASE_URL, params=params, timeout=timeout
@@ -54,16 +131,16 @@ class PokemonTCGClient:
                     except Exception:
                         pass
                 if res.status_code in (429, 500, 502, 503):
-                    time.sleep(0.3 * (attempt + 1))
+                    time.sleep(0.4 * (attempt + 1))
             except requests.exceptions.Timeout as e:
                 print(f"API timeout ({params}): {e}")
-                break
+                if attempt < 2:
+                    time.sleep(0.4 * (attempt + 1))
             except Exception as e:
-                if attempt < 1:
-                    time.sleep(0.3)
+                if attempt < 2:
+                    time.sleep(0.4 * (attempt + 1))
                 else:
                     print(f"API error ({params}): {e}")
-        self._cache[cache_key] = []
         return []
 
     def _extract_root_name(self, name: str) -> str:
@@ -72,6 +149,23 @@ class PokemonTCGClient:
         target = " ".join(words) if words else name
         cleaned = re.sub(r'[^a-zA-Z\s]', '', target).strip()
         return cleaned
+
+    @staticmethod
+    def _format_candidate(card: Dict[str, Any], score: float) -> Dict[str, Any]:
+        """Create a stable, API-facing summary for ranked alternatives."""
+        card_number = str(card.get("number", ""))
+        printed_total = str(card.get("set", {}).get("printedTotal", ""))
+        collector_id = f"{card_number}/{printed_total}" if printed_total else card_number
+        return {
+            "name": card.get("name"),
+            "hp": int(card["hp"]) if str(card.get("hp", "")).isdigit() else None,
+            "unique_id": collector_id,
+            "set_name": card.get("set", {}).get("name"),
+            "set_series": card.get("set", {}).get("series"),
+            "rarity": card.get("rarity", "Unknown"),
+            "image_url": card.get("images", {}).get("large"),
+            "confidence": round(max(0.0, min(score / 100.0, 1.0)), 2),
+        }
 
     def verify_card(
         self,
@@ -107,21 +201,32 @@ class PokemonTCGClient:
         else:
             num_query = None
 
+        candidates.extend(self._search_local_catalog(ocr_name, num_query))
+
         # Strategy 1: Search by root Pokémon name
-        if ocr_name:
+        if ocr_name and not candidates:
             root_name = self._extract_root_name(ocr_name)
             if root_name:
                 data = self._safe_get({"q": f'name:"{root_name}"'})
                 if not data:
                     data = self._safe_get({"q": f"name:{root_name}*"})
-                if not data and len(root_name) >= 4:
-                    # Fallback for minor OCR typos (e.g. 'Charizardd' -> search 'Char*')
-                    data = self._safe_get({"q": f"name:{root_name[:4]}*"})
+                if not data and len(root_name) >= 3:
+                    # Progressive prefix fallback handles trailing OCR noise such
+                    # as "Mewe" -> "Mew*" without immediately issuing a broad query.
+                    for prefix_length in (4, 3):
+                        if len(root_name) < prefix_length:
+                            continue
+                        data = self._safe_get({"q": f"name:{root_name[:prefix_length]}*"})
+                        if data:
+                            break
                 candidates.extend(data)
 
         # Strategy 2: Search by Collector Number
-        if num_query:
+        if num_query and not candidates:
             data = self._safe_get({"q": f"number:{num_query}"})
+            numeric_query = re.sub(r"\D", "", num_query).lstrip("0") or "0"
+            if not data and numeric_query != num_query:
+                data = self._safe_get({"q": f"number:{numeric_query}"})
             existing_ids = {c.get("id") for c in candidates}
             for c in data:
                 if c.get("id") not in existing_ids:
@@ -140,6 +245,9 @@ class PokemonTCGClient:
         best_match = None
         best_score = -1.0
         best_subscores_count = 0
+        best_strong_match = False
+        best_has_set_identity = False
+        ranked_candidates = []
 
         for card in candidates:
             card_name = card.get("name", "")
@@ -177,12 +285,18 @@ class PokemonTCGClient:
                                 total_score = 50.0
                     except ValueError:
                         pass
-            elif is_special_subset or not target_total_raw:
+            elif is_special_subset:
                 # Promo cards or subset cards with missing denominator
                 total_score = 80.0
 
-            hp_score    = 100.0 if (ocr_hp and card_hp and ocr_hp == card_hp) else (40.0 if not ocr_hp else 0.0)
-            name_score  = float(fuzz.partial_ratio(ocr_name.lower(), card_name.lower())) if ocr_name else 50.0
+            hp_score = 100.0 if (ocr_hp and card_hp and ocr_hp == card_hp) else 0.0
+            name_score = (
+                float(max(
+                    fuzz.ratio(ocr_name.lower(), card_name.lower()),
+                    fuzz.token_set_ratio(ocr_name.lower(), card_name.lower()),
+                ))
+                if ocr_name else 0.0
+            )
 
             # Number match score (exact match = 100, suffix/subset match = 80)
             num_score = 0.0
@@ -201,15 +315,47 @@ class PokemonTCGClient:
                 total_score = 100.0
 
             # Weighted final score
-            final_score = (total_score * 0.40) + (hp_score * 0.20) + (name_score * 0.20) + (num_score * 0.20)
+            final_score = (
+                total_score * 0.30
+                + num_score * 0.30
+                + name_score * 0.25
+                + hp_score * 0.15
+            )
 
-            # Count non-zero sub-scores for verification threshold gate
-            subscores_count = sum(1 for score in (total_score, hp_score, name_score, num_score) if score > 0)
+            # Count only fields actually observed by OCR. Defaults for absent
+            # fields must never manufacture verification evidence.
+            collector_evidence = bool(
+                num_query
+                and num_score > 0
+                and (not target_total_raw or total_score > 0)
+            )
+            subscores_count = sum((
+                collector_evidence,
+                bool(ocr_name and name_score >= 60),
+                bool(ocr_hp and hp_score > 0),
+            ))
+            strong_collector_match = bool(num_score == 100.0 and total_score >= 90.0)
+            strong_match = bool(
+                strong_collector_match
+                and (name_score >= 60.0 or hp_score == 100.0)
+            )
+            has_set_identity = bool(
+                target_total_raw
+                or (is_special_subset and num_score == 100.0)
+            )
+            ranked_candidates.append((final_score, card))
 
             if final_score > best_score:
                 best_score = final_score
                 best_match = card
                 best_subscores_count = subscores_count
+                best_strong_match = strong_match
+                best_has_set_identity = has_set_identity
+
+        ranked_candidates.sort(key=lambda item: item[0], reverse=True)
+        candidate_summaries = [
+            self._format_candidate(card, score) for score, card in ranked_candidates[:5]
+        ]
 
         # Check for disagreement between Visual Match and OCR text match
         disagreement_warning = None
@@ -227,7 +373,30 @@ class PokemonTCGClient:
                 disagreement_warning = f"Visual candidate '{vis_name}' differs from OCR text '{ocr_name}'."
 
         # If top visual match has high similarity (>0.85) AND agrees or cross-checks with OCR
-        if top_visual_match and top_visual_match.get("similarity_score", 0.0) >= 0.85 and not disagreement_warning:
+        visual_name_agreement = bool(
+            top_visual_match
+            and ocr_name
+            and fuzz.ratio(
+                str(top_visual_match.get("name", "")).lower(), ocr_name.lower()
+            ) >= 75
+        )
+        visual_hp_agreement = bool(
+            top_visual_match
+            and ocr_hp
+            and top_visual_match.get("hp") == ocr_hp
+        )
+        visual_id_agreement = bool(
+            top_visual_match
+            and collector_id
+            and top_visual_match.get("collector_id") == collector_id
+        )
+
+        if (
+            top_visual_match
+            and top_visual_match.get("similarity_score", 0.0) >= 0.88
+            and not disagreement_warning
+            and (visual_name_agreement or visual_hp_agreement or visual_id_agreement)
+        ):
             vis_score = top_visual_match["similarity_score"]
             return {
                 "verified": True,
@@ -245,10 +414,19 @@ class PokemonTCGClient:
                 "visual_match_applied": True,
                 "visual_similarity": round(float(vis_score), 4),
                 "disagreement_warning": None,
+                "candidates": candidate_summaries,
             }
 
-        # Bug 5 Fix: Require best_score >= 45.0 AND at least 2 non-zero sub-scores to prevent weak/false matches
-        if best_match and best_score >= 45.0 and best_subscores_count >= 2:
+        # Accept either a strong full collector-ID/name+HP match, or a high
+        # aggregate score supported by at least two independently observed fields.
+        if best_match and (
+            best_strong_match
+            or (
+                best_has_set_identity
+                and best_score >= 58.0
+                and best_subscores_count >= 2
+            )
+        ):
             card_number_str   = str(best_match.get("number", ""))
             printed_total_str = str(best_match.get("set", {}).get("printedTotal", ""))
 
@@ -282,6 +460,7 @@ class PokemonTCGClient:
                 "market_price": market_price,
                 "visual_match_applied": False,
                 "disagreement_warning": disagreement_warning,
+                "candidates": candidate_summaries,
             }
             if top_visual_match:
                 res["visual_candidate"] = {
@@ -297,6 +476,7 @@ class PokemonTCGClient:
             "confidence": 0.0,
             "best_score": round(best_score, 1) if best_score > 0 else 0.0,
             "message": "No confident database match found.",
+            "candidates": candidate_summaries,
             "disagreement_warning": disagreement_warning,
             "visual_candidate": {
                 "name": top_visual_match.get("name"),
