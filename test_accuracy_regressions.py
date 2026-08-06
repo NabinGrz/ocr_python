@@ -118,5 +118,76 @@ class TestReferenceCard(unittest.TestCase):
         self.assertGreaterEqual(len(result["ocr_id_candidates"]), 1)
 
 
+class TestPrintedIDPipeline(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from custom_card_recognizer import PrintedIDParser, MultiFrameIDVoter
+        cls.parser = PrintedIDParser()
+        cls.voter = MultiFrameIDVoter(min_agreements=3)
+
+    def test_printed_id_parser_formats(self):
+        cases = [
+            ("XY124", "XY124"),
+            ("XY 124", "XY124"),
+            ("4/102", "4/102"),
+            ("4 of 102", "4/102"),
+            ("SV124/198", "SV124/198"),
+            ("TG01/TG30", "TG01/TG30"),
+            ("SV01a", "SV01A"),
+        ]
+        for text, expected in cases:
+            parsed, conf, pattern = self.parser.parse_printed_id(text)
+            self.assertEqual(parsed, expected, f"Failed parsing '{text}', got '{parsed}'")
+            self.assertGreaterEqual(conf, 0.85)
+
+    def test_grammar_aware_confusion_normalization(self):
+        cases = [
+            ("X0124", "XY124"),   # 'O' -> 'Y' in Promo prefix
+            ("XY I24", "XY124"),  # 'I' -> '1' in numeric slot
+            ("S5050", "SWSH050"), # '5' -> 'W' in SWSH prefix
+        ]
+        for text, expected in cases:
+            parsed, conf, pattern = self.parser.parse_printed_id(text)
+            self.assertEqual(parsed, expected, f"Failed normalizing '{text}', got '{parsed}'")
+
+    def test_multi_frame_voting(self):
+        voter = self.voter.__class__(min_agreements=3)
+        self.assertIsNone(voter.get_consensus())
+
+        voter.add_observation("XY124", confidence=0.90)
+        self.assertIsNone(voter.get_consensus())
+
+        voter.add_observation("XY124", confidence=0.95)
+        self.assertIsNone(voter.get_consensus())
+
+        voter.add_observation("XY124", confidence=0.92)
+        self.assertEqual(voter.get_consensus(), "XY124")
+
+    def test_negative_unreadable_printed_id(self):
+        bad_texts = ["ILLUSTRATOR KEN SUGIMORI", "FOIL NOISE 12345", "RANDOM JUNK TEXT"]
+        for bad_text in bad_texts:
+            parsed, conf, pattern = self.parser.parse_printed_id(bad_text)
+            self.assertIsNone(parsed, f"Expected None for '{bad_text}', got '{parsed}'")
+
+
+@unittest.skipUnless(os.path.exists("sample_xy124.png"), "sample_xy124.png is unavailable")
+class TestSampleXY124Card(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.image = cv2.imread("sample_xy124.png")
+        cls.extractor = PokemonCardExtractor(gpu=False)
+
+    def test_xy124_extraction(self):
+        result = self.extractor.extract_from_image(self.image)
+        self.assertEqual(result["name"], "Pikachu ex")
+        self.assertEqual(result["hp"], 130)
+        self.assertEqual(result["normalized_printed_id"], "XY124")
+        self.assertEqual(result["printed_id_roi_source"], "footer_right")
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(result["reason"], "success")
+        self.assertTrue(os.path.exists(result["debug_crop_path"]))
+
+
 if __name__ == "__main__":
     unittest.main()
+

@@ -39,6 +39,8 @@ from custom_card_recognizer import (
     RestrictedAlphabetRecognizer,
     CustomPokemonCardRecognizer,
     ClosedSetCardNameMatcher,
+    PrintedIDParser,
+    MultiFrameIDVoter,
 )
 
 class PokemonCardExtractor:
@@ -60,6 +62,10 @@ class PokemonCardExtractor:
 
         # Closed-set retrieval matcher for Pokémon card names
         self.closed_set_matcher = ClosedSetCardNameMatcher(catalog_path="models/card_catalog.json")
+
+        # Printed ID Parser and Multi-Frame Consensus Voter
+        self.printed_id_parser = PrintedIDParser()
+        self.multi_frame_voter = MultiFrameIDVoter(min_agreements=3)
 
         # Initialize YOLO card detector if available
         if get_card_detector is not None:
@@ -182,20 +188,97 @@ class PokemonCardExtractor:
 
     def crop_rois(self, card_img: np.ndarray) -> Dict[str, np.ndarray]:
         """
-        Crops ROIs for OCR:
-        - Header (Name & HP): top 18%
-        - Footer Wide: bottom 25%
-        - Footer Tight (Collector ID line): bottom 12%
+        Crops ROIs for OCR using normalized coordinates relative to the rectified card:
+        - Header (Name & HP): ymin=0.00, ymax=0.18, xmin=0.00, xmax=1.00
+        - Footer Left (Standard ID): ymin=0.84, ymax=0.98, xmin=0.02, xmax=0.55
+        - Footer Right (Promo/XY ID): ymin=0.84, ymax=0.98, xmin=0.50, xmax=0.97
+        - Footer Wide (Full bottom context): ymin=0.75, ymax=0.98, xmin=0.02, xmax=0.98
         """
         h, w = card_img.shape[:2]
-        header_crop = card_img[0:int(h * 0.18), 0:w]
-        footer_crop = card_img[int(h * 0.75):h, 0:w]
-        footer_tight_crop = card_img[int(h * 0.88):h, 0:w]
+
+        def crop_norm(ymin, ymax, xmin, xmax):
+            y1, y2 = int(h * ymin), int(h * ymax)
+            x1, x2 = int(w * xmin), int(w * xmax)
+            return card_img[y1:y2, x1:x2]
+
+        header_crop = crop_norm(0.00, 0.18, 0.00, 1.00)
+        footer_left_crop = crop_norm(0.84, 0.98, 0.02, 0.55)
+        footer_right_crop = crop_norm(0.84, 0.98, 0.50, 0.97)
+        footer_wide_crop = crop_norm(0.75, 0.98, 0.02, 0.98)
 
         return {
             "header": header_crop,
-            "footer": footer_crop,
-            "footer_tight": footer_tight_crop,
+            "footer_left": footer_left_crop,
+            "footer_right": footer_right_crop,
+            "footer_wide": footer_wide_crop,
+            "footer_tight": footer_left_crop,  # backward compatibility alias
+            "footer": footer_wide_crop,         # backward compatibility alias
+        }
+
+    def save_debug_roi_image(
+        self, card_img: np.ndarray, output_path: str = "debug_crops/debug_rectified_roi.png"
+    ) -> str:
+        """
+        Saves a debug crop image with colored ROI bounding boxes drawn on the rectified card.
+        """
+        if card_img is None or card_img.size == 0:
+            return ""
+
+        debug_img = card_img.copy()
+        h, w = debug_img.shape[:2]
+
+        rois_to_draw = [
+            (0.00, 0.18, 0.00, 1.00, (255, 0, 0), "HEADER (0.00-0.18)"),
+            (0.84, 0.98, 0.02, 0.55, (0, 255, 0), "FOOTER_LEFT (0.84-0.98, 0.02-0.55)"),
+            (0.84, 0.98, 0.50, 0.97, (0, 0, 255), "FOOTER_RIGHT (0.84-0.98, 0.50-0.97)"),
+        ]
+
+        for ymin, ymax, xmin, xmax, color, label in rois_to_draw:
+            pt1 = (int(w * xmin), int(h * ymin))
+            pt2 = (int(w * xmax), int(h * ymax))
+            cv2.rectangle(debug_img, pt1, pt2, color, 2)
+            cv2.putText(debug_img, label, (pt1[0] + 5, pt1[1] + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        cv2.imwrite(output_path, debug_img)
+        return output_path
+
+    def generate_preprocessing_variants(self, crop: np.ndarray) -> Dict[str, np.ndarray]:
+        """
+        Takes crop BEFORE aggressive resizing/compression.
+        Upscales crop 4x using INTER_CUBIC, then generates 6 preprocessing variants:
+        - original_color
+        - grayscale_norm
+        - clahe
+        - adaptive_thresh
+        - dark_text_light_bg
+        - light_text_dark_bg
+        """
+        if crop is None or crop.size == 0:
+            return {}
+
+        upscaled = cv2.resize(crop, (crop.shape[1] * 4, crop.shape[0] * 4), interpolation=cv2.INTER_CUBIC)
+
+        gray = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY) if len(upscaled.shape) == 3 else upscaled.copy()
+        norm_gray = cv2.normalize(gray, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
+
+        clahe_engine = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        clahe_gray = clahe_engine.apply(norm_gray)
+
+        adaptive_thresh = cv2.adaptiveThreshold(
+            clahe_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 4
+        )
+
+        _, dark_text = cv2.threshold(clahe_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        light_text = cv2.bitwise_not(dark_text)
+
+        return {
+            "original_color": upscaled,
+            "grayscale_norm": cv2.cvtColor(norm_gray, cv2.COLOR_GRAY2BGR),
+            "clahe": cv2.cvtColor(clahe_gray, cv2.COLOR_GRAY2BGR),
+            "adaptive_thresh": cv2.cvtColor(adaptive_thresh, cv2.COLOR_GRAY2BGR),
+            "dark_text_light_bg": cv2.cvtColor(dark_text, cv2.COLOR_GRAY2BGR),
+            "light_text_dark_bg": cv2.cvtColor(light_text, cv2.COLOR_GRAY2BGR),
         }
 
     def _enhance_roi(self, roi: np.ndarray) -> np.ndarray:
@@ -451,12 +534,19 @@ class PokemonCardExtractor:
 
     def parse_collector_id(self, text: str) -> Optional[str]:
         """
-        Extracts Collector ID from footer text with support for:
-        - Standard numbers (074/084)
-        - Secret Rares / SIRs (199/165, 251/198)
-        - Trainer Gallery / Special Subsets (TG01/TG30, GG12/GG70, RC01/RC25, SV01/SV94)
-        - Promos (SWSH050, SVP025, SM210, XY100)
+        Extracts Collector ID from footer text using PrintedIDParser.
+        Supports formats:
+        - XY124 / XY 124 (Promo prefix)
+        - 4/102, 124/165 (Standard numeric fraction)
+        - 4 of 102 (Word 'of' fraction)
+        - SV124/198, TG01/TG30 (Subset / Alphanumeric fraction)
+        - SV01a (Suffix ID)
         """
+        parsed_id, conf, pattern = self.printed_id_parser.parse_printed_id(text)
+        if parsed_id and conf >= 0.85:
+            return parsed_id
+
+        # Fallback to pattern rules
         fixed_text = self._fix_collector_id_slashes(text)
 
         def fix_num_str(s: str) -> str:
@@ -500,7 +590,6 @@ class PokemonCardExtractor:
                 total_val = int(total_raw)
                 if 0 < num_val <= 999 and 0 < total_val <= 999:
                     corrected_total = self._correct_set_total(total_raw)
-                    # Correct leading '4' misreads in numerators (e.g. '422' -> '122' when set is '086' or number > 300)
                     corrected_num = num_raw
                     if len(num_raw) == 3 and num_raw.startswith('4'):
                         if int(num_raw) > 300 or corrected_total in ('086', '088', '198', '165', '182'):
@@ -511,45 +600,31 @@ class PokemonCardExtractor:
                     candidates.append((score, candidate_id))
 
         if candidates:
-            # Sort by candidate score descending and return highest scoring candidate
             candidates.sort(key=lambda x: x[0], reverse=True)
             return candidates[0][1]
 
         return None
 
     def _normalize_token(self, text: str) -> str:
-        """
-        Cleans OCR token for name parsing:
-        - Bug 2 Fix: Strips trailing non-alphanumeric junk characters first so end-anchored
-          suffixes (like 'ex', '@X', 'eX') match even when followed by foil/noise symbols.
-        - 'Charizardex@' -> 'Charizard ex'
-        - 'Greninja@X.'  -> 'Greninja ex'
-        - 'GreninjaN'    -> 'Greninja' (trailing single uppercase noise char)
-        """
-        # Bug 2 Fix: Strip trailing non-alphanumeric junk characters first
         fixed = re.sub(r'[^a-zA-Z0-9]+$', '', text.strip())
 
-        # Fix ex/GX suffix misreads (e.g. 'Charizardex' -> 'Charizard ex', 'Greninja@X' -> 'Greninja ex')
         if re.search(r'[eE3@][xX]$', fixed):
             fixed = re.sub(r'^(.*?)(?:[@\*\s]?[eE3@][xX])$', r'\1 ex', fixed)
 
-        # Strip trailing single uppercase letter that doesn't look intentional (e.g. "GreninjaN" -> "Greninja")
         fixed = re.sub(r'([a-z])[A-Z]$', r'\1', fixed)
 
-        # Remove remaining non-letter chars except space, hyphen, apostrophe
         fixed = re.sub(r'[^a-zA-Z\s\'-]', '', fixed).strip()
         return fixed
 
     def extract_from_image(self, image_np: np.ndarray) -> Dict[str, Any]:
         """
-        Full extraction pipeline: YOLO / Dewarping → ROI crop → enhance → OCR → parse.
-        Uses YOLO bounding box detections if confident; falls back to contour-based dewarping + percentage crop.
+        Full extraction pipeline: YOLO / Dewarping → ROI crop → 6-variant enhance → OCR → parse.
+        Uses YOLO bounding box detections if confident; falls back to contour-based dewarping + ratio crop.
         """
         warped = None
         rois = None
         yolo_used = False
 
-        # Component 1 Layer: Try YOLO Card/Region Detection first
         if self.yolo_detector is not None and self.yolo_detector.is_available():
             try:
                 detections = self.yolo_detector.detect_regions(image_np, conf_threshold=0.6)
@@ -560,22 +635,16 @@ class PokemonCardExtractor:
                 warped = None
                 rois = None
 
-        # Fallback to contour-based dewarping & fixed percentage crops if YOLO is absent or low confidence
         if not yolo_used or warped is None or rois is None:
             warped = self.preprocess_and_warp(image_np)
             rois = self.crop_rois(warped)
 
-        id_allowlist = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz/-| "
-        header_variants = self._ocr_variants(rois["header"], field_type="header")
-        footer_tight_variants = self._ocr_variants(rois["footer_tight"], allowlist=id_allowlist, field_type="collector_id")
-        footer_variants = self._ocr_variants(rois["footer"], allowlist=id_allowlist, field_type="collector_id")
+        # 1. Save debug ROI crop visualization
+        debug_crop_path = self.save_debug_roi_image(warped, output_path="debug_crops/debug_rectified_roi.png")
 
+        # 2. Header Extraction
+        header_variants = self._ocr_variants(rois["header"], field_type="header")
         header_texts = ["\n".join(r[1] for r in results) for results in header_variants]
-        footer_tight_texts = ["\n".join(r[1] for r in results) for results in footer_tight_variants]
-        footer_texts = [
-            "\n".join(r[1] for r in sorted(results, key=lambda r: r[0][0][1], reverse=True))
-            for results in footer_variants
-        ]
 
         name_candidates = [
             candidate
@@ -586,9 +655,6 @@ class PokemonCardExtractor:
             candidate for candidate in (self.parse_hp(text) for text in header_texts) if candidate is not None
         ]
 
-        # Closed-set card name retrieval step:
-        # OCR produces candidates across recognition paths, then fuzzy-matches against known catalog names.
-        # Never accept an arbitrary OCR string when the database can provide the answer.
         closed_set_name, closed_set_conf = self.closed_set_matcher.resolve_candidates(name_candidates)
         if closed_set_name and closed_set_conf >= 0.55:
             name = closed_set_name
@@ -598,22 +664,65 @@ class PokemonCardExtractor:
         hp = self._modal_value(hp_candidates)
         header_text = "\n--- OCR PASS ---\n".join(header_texts)
 
-        # Prefer IDs that repeat across preprocessing and crop variants.
-        id_observations = []
-        for text in footer_tight_texts + footer_texts:
-            candidate = self.parse_collector_id(text)
-            if candidate:
-                id_observations.append(candidate)
-        collector_id = self._modal_value(id_observations)
+        # 3. Printed ID Extraction with 6 Preprocessing Variants & Multiple Footer ROIs
+        raw_ocr_outputs: Dict[str, str] = {}
+        id_observations: List[str] = []
+        printed_id_roi_source: str = "none"
+        collector_id: Optional[str] = None
+        parsed_candidates: List[Tuple[float, str, str]] = []
 
-        tight_ids = [self.parse_collector_id(text) for text in footer_tight_texts]
-        tight_ids = [candidate for candidate in tight_ids if candidate]
-        use_tight_footer = bool(collector_id and collector_id in tight_ids)
-        raw_footer = "\n--- OCR PASS ---\n".join(
-            footer_tight_texts if use_tight_footer else footer_texts
-        )
+        id_allowlist = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/- "
+        eval_rois = [
+            ("footer_left", rois["footer_left"]),
+            ("footer_right", rois["footer_right"]),
+            ("footer_wide", rois["footer_wide"]),
+        ]
 
-        # Fallback: Run OCR on full warped card if name, hp, or collector_id are missing
+        for roi_name, roi_crop in eval_rois:
+            if roi_crop is None or roi_crop.size == 0:
+                continue
+
+            variants_dict = self.generate_preprocessing_variants(roi_crop)
+            for v_name, v_img in variants_dict.items():
+                ocr_results = self.reader.readtext(
+                    v_img,
+                    detail=1,
+                    decoder="beamsearch",
+                    beamWidth=5,
+                    paragraph=False,
+                    allowlist=id_allowlist,
+                )
+                ocr_results.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
+                variant_text = "\n".join(r[1] for r in ocr_results)
+                raw_ocr_outputs[f"{roi_name}_{v_name}"] = variant_text
+
+                parsed_id, conf, pattern = self.printed_id_parser.parse_printed_id(variant_text)
+                if not parsed_id:
+                    parsed_id = self.parse_collector_id(variant_text)
+                    if parsed_id:
+                        conf = 0.85
+                        pattern = "legacy_pattern"
+
+                if parsed_id:
+                    id_observations.append(parsed_id)
+                    score = conf
+                    if pattern in ("standard_fraction", "subset_fraction", "of_fraction") and roi_name == "footer_left":
+                        score += 0.05
+                    elif pattern == "promo_prefix" and roi_name == "footer_right":
+                        score += 0.05
+                    parsed_candidates.append((score, parsed_id, roi_name))
+
+        if parsed_candidates:
+            parsed_candidates.sort(key=lambda x: x[0], reverse=True)
+            collector_id = parsed_candidates[0][1]
+            printed_id_roi_source = parsed_candidates[0][2]
+        elif id_observations:
+            collector_id = self._modal_value(id_observations)
+
+        if collector_id:
+            self.multi_frame_voter.add_observation(collector_id, confidence=0.90)
+
+        # Fallback: Run OCR on full warped card if fields missing
         if not name or not collector_id or not hp:
             full_variants = self._ocr_variants(warped, field_type="all")
             full_texts = ["\n".join(r[1] for r in results) for results in full_variants]
@@ -635,16 +744,31 @@ class PokemonCardExtractor:
             if not collector_id:
                 full_ids = [self.parse_collector_id(text) for text in full_texts]
                 collector_id = self._modal_value([candidate for candidate in full_ids if candidate])
+                if collector_id:
+                    printed_id_roi_source = "warped_full"
+
+        raw_footer = "\n--- RAW OCR PASS ---\n".join(
+            f"[{k}]: {v}" for k, v in raw_ocr_outputs.items()
+        )
+
+        status = "accepted" if collector_id else "rejected"
+        reason = "success" if collector_id else "unreadable_printed_id"
 
         return {
             "name": name,
             "hp": hp,
             "unique_id": collector_id,
+            "normalized_printed_id": collector_id,
+            "printed_id_roi_source": printed_id_roi_source,
+            "raw_ocr_outputs": raw_ocr_outputs,
+            "debug_crop_path": debug_crop_path,
+            "status": status,
+            "reason": reason,
             "header_raw_ocr": header_text,
             "footer_raw_ocr": raw_footer,
             "warped_card": warped,
             "header_crop": rois["header"],
-            "footer_crop": rois["footer_tight"] if use_tight_footer else rois["footer"],
+            "footer_crop": rois.get(printed_id_roi_source, rois["footer_left"]),
             "ocr_name_candidates": name_candidates,
             "ocr_hp_candidates": hp_candidates,
             "ocr_id_candidates": id_observations,
