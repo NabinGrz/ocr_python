@@ -130,6 +130,45 @@ class TestDLComponents(unittest.TestCase):
         # 5. Protected valid set total (165 should not become 168)
         self.assertEqual(extractor._correct_set_total("165"), "165")
 
+    # -------------------------------------------------------------------------
+    # Multi-Path Recognition & Closed-Set Name Retrieval Tests
+    # -------------------------------------------------------------------------
+    def test_closed_set_name_matcher(self):
+        """Tests database-backed closed-set card name resolution."""
+        from custom_card_recognizer import ClosedSetCardNameMatcher
+        matcher = ClosedSetCardNameMatcher(catalog_path="models/card_catalog.json")
+        self.assertGreater(len(matcher.canonical_names), 0)
+
+        # Test noisy/misread OCR candidates snapping to database names
+        matched_name, conf = matcher.match_name("Charizardex")
+        self.assertEqual(matched_name, "Charizard-EX")
+        self.assertGreaterEqual(conf, 0.8)
+
+        matched_name, conf = matcher.match_name("Mewe")
+        self.assertEqual(matched_name, "Mew-EX")
+        self.assertGreaterEqual(conf, 0.8)
+
+        # Test resolving candidate list
+        res_name, res_conf = matcher.resolve_candidates(["Charizardex", "Charizard ex"])
+        self.assertEqual(res_name, "Charizard-EX")
+
+    def test_restricted_alphabet_recognizer(self):
+        """Tests constraint-based recognition with restricted alphabets for HP and Collector IDs."""
+        from custom_card_recognizer import RestrictedAlphabetRecognizer
+        recognizer = RestrictedAlphabetRecognizer()
+        
+        # Test HP crop recognition
+        hp_crop = np.zeros((40, 120, 3), dtype=np.uint8)
+        cv2.putText(hp_crop, "330 HP", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        hp_results = recognizer.recognize_crop(hp_crop, field_type="hp")
+        self.assertTrue(isinstance(hp_results, list))
+
+        # Test Collector ID crop recognition
+        id_crop = np.zeros((40, 160, 3), dtype=np.uint8)
+        cv2.putText(id_crop, "199/165", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        id_results = recognizer.recognize_crop(id_crop, field_type="collector_id")
+        self.assertTrue(isinstance(id_results, list))
+
 
 if __name__ == "__main__":
     unittest.main()

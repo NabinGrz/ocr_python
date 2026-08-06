@@ -30,10 +30,36 @@ try:
 except ImportError:
     classify_frame_quality = None
 
+try:
+    from paddleocr import PaddleOCR
+except ImportError:
+    PaddleOCR = None
+
+from custom_card_recognizer import (
+    RestrictedAlphabetRecognizer,
+    CustomPokemonCardRecognizer,
+    ClosedSetCardNameMatcher,
+)
+
 class PokemonCardExtractor:
     def __init__(self, languages=['en'], gpu=False):
         # Initialize EasyOCR reader
         self.reader = easyocr.Reader(languages, gpu=gpu)
+
+        # Path 1 Engine B: Initialize PaddleOCR reader if available
+        self.paddle_ocr = None
+        if PaddleOCR is not None:
+            try:
+                self.paddle_ocr = PaddleOCR(lang='en')
+            except Exception:
+                self.paddle_ocr = None
+
+        # Path 2 Engine A & B: Initialize custom Pokémon recognizer and restricted alphabet classifier
+        self.restricted_recognizer = RestrictedAlphabetRecognizer()
+        self.custom_recognizer = CustomPokemonCardRecognizer(self.restricted_recognizer)
+
+        # Closed-set retrieval matcher for Pokémon card names
+        self.closed_set_matcher = ClosedSetCardNameMatcher(catalog_path="models/card_catalog.json")
 
         # Initialize YOLO card detector if available
         if get_card_detector is not None:
@@ -189,12 +215,47 @@ class PokemonCardExtractor:
 
         return cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
 
+    def _run_paddle_ocr(self, roi: np.ndarray) -> List[Tuple[list, str, float]]:
+        """Run PaddleOCR/PP-OCR recognizer as standard OCR Path 1 Engine B."""
+        if self.paddle_ocr is None or roi is None or roi.size == 0:
+            return []
+        try:
+            res = self.paddle_ocr.ocr(roi)
+            formatted = []
+            if not res:
+                return formatted
+            for item in res:
+                if isinstance(item, dict):
+                    texts = item.get("rec_texts", [])
+                    scores = item.get("rec_scores", [])
+                    polys = item.get("rec_polys", item.get("rec_boxes", []))
+                    for i, text in enumerate(texts):
+                        score = float(scores[i]) if i < len(scores) else 0.9
+                        poly = polys[i].tolist() if hasattr(polys[i], "tolist") else (polys[i] if i < len(polys) else [[0, 0], [10, 0], [10, 10], [0, 10]])
+                        formatted.append((poly, str(text), score))
+                elif isinstance(item, list):
+                    for sub_item in item:
+                        if isinstance(sub_item, (list, tuple)) and len(sub_item) == 2:
+                            box, val = sub_item
+                            if isinstance(val, (list, tuple)) and len(val) == 2:
+                                text, prob = val
+                                box = box.tolist() if hasattr(box, "tolist") else box
+                                formatted.append((box, str(text), float(prob)))
+            return formatted
+        except Exception:
+            return []
+
     def _ocr_variants(
         self,
         roi: np.ndarray,
         allowlist: Optional[str] = None,
+        field_type: str = "all",
     ) -> List[List[Tuple]]:
-        """Run complementary OCR passes so one preprocessing choice cannot dominate."""
+        """
+        Runs multiple recognition paths for each ROI:
+        - Path 1: Standard OCR Recognizers (EasyOCR & PaddleOCR/PP-OCR)
+        - Path 2: Custom Pokémon Card Recognizer & Restricted Alphabet Recognizer
+        """
         if roi is None or roi.size == 0:
             return []
 
@@ -207,6 +268,7 @@ class PokemonCardExtractor:
         variants = [enhanced, upscaled]
         results = []
 
+        # Path 1 Engine A: EasyOCR
         for variant in variants:
             kwargs = {
                 "detail": 1,
@@ -219,6 +281,25 @@ class PokemonCardExtractor:
             ocr_result = self.reader.readtext(variant, **kwargs)
             ocr_result.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
             results.append(ocr_result)
+
+        # Path 1 Engine B: PaddleOCR / PP-OCR
+        if self.paddle_ocr is not None:
+            for variant in variants:
+                paddle_res = self._run_paddle_ocr(variant)
+                if paddle_res:
+                    paddle_res.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
+                    results.append(paddle_res)
+
+        # Path 2: Custom Recognizer & Restricted Alphabet Classifier
+        if field_type in ("collector_id", "hp"):
+            restricted_res = self.restricted_recognizer.recognize_crop(roi, field_type=field_type)
+            if restricted_res:
+                results.append(restricted_res)
+
+        if field_type == "header":
+            custom_res = self.custom_recognizer.recognize_header(roi)
+            if custom_res:
+                results.append(custom_res)
 
         return results
 
@@ -485,9 +566,9 @@ class PokemonCardExtractor:
             rois = self.crop_rois(warped)
 
         id_allowlist = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz/-| "
-        header_variants = self._ocr_variants(rois["header"])
-        footer_tight_variants = self._ocr_variants(rois["footer_tight"], id_allowlist)
-        footer_variants = self._ocr_variants(rois["footer"], id_allowlist)
+        header_variants = self._ocr_variants(rois["header"], field_type="header")
+        footer_tight_variants = self._ocr_variants(rois["footer_tight"], allowlist=id_allowlist, field_type="collector_id")
+        footer_variants = self._ocr_variants(rois["footer"], allowlist=id_allowlist, field_type="collector_id")
 
         header_texts = ["\n".join(r[1] for r in results) for results in header_variants]
         footer_tight_texts = ["\n".join(r[1] for r in results) for results in footer_tight_variants]
@@ -505,7 +586,15 @@ class PokemonCardExtractor:
             candidate for candidate in (self.parse_hp(text) for text in header_texts) if candidate is not None
         ]
 
-        name, _ = self._fuzzy_name_consensus(name_candidates)
+        # Closed-set card name retrieval step:
+        # OCR produces candidates across recognition paths, then fuzzy-matches against known catalog names.
+        # Never accept an arbitrary OCR string when the database can provide the answer.
+        closed_set_name, closed_set_conf = self.closed_set_matcher.resolve_candidates(name_candidates)
+        if closed_set_name and closed_set_conf >= 0.55:
+            name = closed_set_name
+        else:
+            name, _ = self._fuzzy_name_consensus(name_candidates)
+
         hp = self._modal_value(hp_candidates)
         header_text = "\n--- OCR PASS ---\n".join(header_texts)
 
@@ -526,7 +615,7 @@ class PokemonCardExtractor:
 
         # Fallback: Run OCR on full warped card if name, hp, or collector_id are missing
         if not name or not collector_id or not hp:
-            full_variants = self._ocr_variants(warped)
+            full_variants = self._ocr_variants(warped, field_type="all")
             full_texts = ["\n".join(r[1] for r in results) for results in full_variants]
 
             if not name:
@@ -535,7 +624,11 @@ class PokemonCardExtractor:
                     for candidate in (self._extract_name_by_font_size(results) for results in full_variants)
                     if candidate
                 ]
-                name = self._modal_value(full_names)
+                closed_set_full, _ = self.closed_set_matcher.resolve_candidates(full_names)
+                if closed_set_full:
+                    name = closed_set_full
+                else:
+                    name = self._modal_value(full_names)
             if not hp:
                 full_hps = [self.parse_hp(text) for text in full_texts]
                 hp = self._modal_value([candidate for candidate in full_hps if candidate is not None])
