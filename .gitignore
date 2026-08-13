@@ -49,3 +49,5 @@ htmlcov/
 *.log
 *.tmp
 *.temp
+
+debug_crops/
