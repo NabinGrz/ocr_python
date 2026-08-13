@@ -13,7 +13,7 @@ from typing import Optional, Dict, Any, List
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 from pokemon_card_ocr import PokemonCardExtractor
@@ -142,7 +142,7 @@ class CardScanResponse(BaseModel):
     message: Optional[str] = None
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
     logger.info("Root endpoint hit")
     return {
@@ -155,10 +155,28 @@ def root():
     }
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health_check():
     logger.info("Health check endpoint hit")
     return {"status": "ok", "service": "pokemon-tcg-ocr"}
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return Response(status_code=204)
+
+
+@app.api_route("/scan", methods=["GET", "HEAD"], include_in_schema=False)
+@app.api_route("/api/v1/scan", methods=["GET", "HEAD"], include_in_schema=False)
+def scan_info():
+    return {
+        "status": "ok",
+        "message": "Use POST with multipart/form-data ('file') to scan Pokémon cards.",
+        "endpoints": {
+            "single_scan": "POST /api/v1/scan",
+            "burst_stream": "POST /api/v1/scan/stream"
+        }
+    }
 
 
 @app.post("/api/v1/scan/stream", response_model=CardScanResponse)
@@ -250,6 +268,7 @@ async def scan_card_stream(files: List[UploadFile] = File(...)):
 
 
 @app.post("/api/v1/scan", response_model=CardScanResponse)
+@app.post("/scan", response_model=CardScanResponse, include_in_schema=False)
 async def scan_card(
     file: UploadFile = File(...),
     save_debug: bool = Query(True, description="Whether to persist all transformed pipeline images to debug_crops/latest"),

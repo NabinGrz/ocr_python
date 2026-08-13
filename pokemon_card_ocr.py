@@ -138,13 +138,16 @@ class PokemonCardExtractor:
 
     @property
     def paddle_ocr(self):
-        """Lazy loader for PaddleOCR instance."""
+        """Lazy loader for PaddleOCR instance (disabled by default in constrained RAM environments)."""
         if not self._paddle_initialized:
             self._paddle_initialized = True
-            try:
-                from paddleocr import PaddleOCR
-                self._paddle_ocr = PaddleOCR(lang='en')
-            except Exception:
+            if os.getenv("ENABLE_PADDLE_OCR", "false").lower() in ("true", "1", "yes"):
+                try:
+                    from paddleocr import PaddleOCR
+                    self._paddle_ocr = PaddleOCR(lang='en')
+                except Exception:
+                    self._paddle_ocr = None
+            else:
                 self._paddle_ocr = None
         return self._paddle_ocr
 
