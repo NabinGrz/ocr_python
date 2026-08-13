@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: pokemon-ocr-api
+    env: docker
+    plan: standard
+    dockerfilePath: Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: POKEMON_TCG_API_KEY
+        sync: false

@@ -1,0 +1,10 @@
+.venv
+__pycache__
+*.pyc
+.git
+.gitignore
+.DS_Store
+.serena
+debug_crops/*
+!debug_crops/latest
+tests/__pycache__
