@@ -4,7 +4,8 @@ FROM python:3.10-slim
 # Prevent Python from writing .pyc files & enable unbuffered logging
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PORT=8000
+    PORT=8000 \
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
@@ -17,14 +18,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install PyTorch CPU first to keep image lightweight (avoids 4GB+ CUDA wheels)
-RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# Upgrade pip & build dependencies
+RUN pip install --upgrade pip setuptools wheel
+
+# Install PyTorch CPU wheels using --extra-index-url so PyPI is still queried for flit_core/build tools
+RUN pip install torch torchvision --extra-index-url https://download.pytorch.org/whl/cpu
 
 # Copy requirements and install remaining dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
 
-# Pre-warm EasyOCR model cache so inference is instantaneous on cold start
+# Pre-warm EasyOCR model cache so inference is instantaneous on container start
 RUN python -c "import easyocr; easyocr.Reader(['en'], gpu=False)"
 
 # Copy application source code and models
