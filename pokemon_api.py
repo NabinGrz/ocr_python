@@ -53,7 +53,16 @@ class PokemonTCGClient:
         keys = {raw, raw.lstrip("0") or "0"}
         digits = re.sub(r"\D", "", raw)
         if digits:
-            keys.update({digits, digits.lstrip("0") or "0"})
+            keys.update({digits, digits.lstrip("0") or "0", digits.zfill(2), digits.zfill(3)})
+        prefix_match = re.match(r"^([A-Z]+)[-_ ]*(\d+)$", raw)
+        if prefix_match:
+            pfx, num = prefix_match.groups()
+            keys.update({
+                f"{pfx}{num}",
+                f"{pfx}{num.lstrip('0') or '0'}",
+                f"{pfx}{num.zfill(2)}",
+                f"{pfx}{num.zfill(3)}",
+            })
         return list(keys)
 
     def _load_local_catalog(self) -> None:
@@ -64,8 +73,42 @@ class PokemonTCGClient:
                 payload = json.load(source)
             self._local_cards = payload.get("cards", payload) if isinstance(payload, dict) else payload
             for card in self._local_cards:
-                for key in self._number_keys(card.get("number", "")):
+                set_id = str(card.get("set", {}).get("id", "")).lower()
+                num_str = str(card.get("number", ""))
+                
+                # Base number keys
+                for key in self._number_keys(num_str):
                     self._cards_by_number.setdefault(key, []).append(card)
+
+                # Promo and special subset alias indexing
+                digits = re.sub(r"\D", "", num_str)
+                if digits:
+                    if set_id == "svp":
+                        for pfx in ("SVP", "SV-P", "SV"):
+                            self._cards_by_number.setdefault(f"{pfx}{digits}", []).append(card)
+                            self._cards_by_number.setdefault(f"{pfx}{digits.zfill(3)}", []).append(card)
+                            self._cards_by_number.setdefault(f"{pfx}{digits.lstrip('0') or '0'}", []).append(card)
+                    elif set_id == "swshp":
+                        for pfx in ("SWSH", "SWSH-"):
+                            self._cards_by_number.setdefault(f"{pfx}{digits}", []).append(card)
+                            self._cards_by_number.setdefault(f"{pfx}{digits.zfill(3)}", []).append(card)
+                    elif set_id == "smp":
+                        for pfx in ("SM", "SM-"):
+                            self._cards_by_number.setdefault(f"{pfx}{digits}", []).append(card)
+                            self._cards_by_number.setdefault(f"{pfx}{digits.zfill(2)}", []).append(card)
+                            self._cards_by_number.setdefault(f"{pfx}{digits.zfill(3)}", []).append(card)
+                    elif set_id == "xyp":
+                        for pfx in ("XY", "XY-"):
+                            self._cards_by_number.setdefault(f"{pfx}{digits}", []).append(card)
+                            self._cards_by_number.setdefault(f"{pfx}{digits.zfill(2)}", []).append(card)
+                            self._cards_by_number.setdefault(f"{pfx}{digits.zfill(3)}", []).append(card)
+                    elif set_id.endswith("tg"):
+                        self._cards_by_number.setdefault(f"TG{digits.zfill(2)}", []).append(card)
+                    elif set_id.endswith("gg"):
+                        self._cards_by_number.setdefault(f"GG{digits.zfill(2)}", []).append(card)
+                    elif set_id.endswith("sv") or set_id == "sma":
+                        self._cards_by_number.setdefault(f"SV{digits.zfill(3)}", []).append(card)
+
                 root_name = self._extract_root_name(str(card.get("name", ""))).lower()
                 if root_name:
                     self._cards_by_name.setdefault(root_name, []).append(card)
@@ -259,10 +302,18 @@ class PokemonTCGClient:
             target_digits = re.sub(r'\D', '', target_total_raw) if target_total_raw else ""
             set_digits = re.sub(r'\D', '', set_total) if set_total else ""
 
-            # Check if this card belongs to a special subset / promo (TG, GG, SV, RC, SWSH, SVP)
-            is_special_subset = any(
-                card_number.upper().startswith(p) or (num_query and num_query.upper().startswith(p))
-                for p in ('TG', 'GG', 'SV', 'RC', 'SWSH', 'SVP', 'W', 'PROMO')
+            set_id = str(card.get("set", {}).get("id", "")).lower()
+            set_name = str(card.get("set", {}).get("name", "")).lower()
+
+            # Check if this card belongs to a special subset / promo (TG, GG, SV, RC, SWSH, SVP, SM, XY, BW, HGSS, DP)
+            is_special_subset = (
+                any(
+                    card_number.upper().startswith(p) or (num_query and num_query.upper().startswith(p))
+                    for p in ('TG', 'GG', 'SV', 'RC', 'SWSH', 'SVP', 'SM', 'XY', 'BW', 'HGSS', 'DP', 'PROMO', 'W', 'NP', 'POP')
+                )
+                or 'promo' in set_name
+                or set_id in ('svp', 'swshp', 'smp', 'xyp', 'bwp', 'hsp', 'dpp', 'basep', 'np')
+                or set_id.endswith(('tg', 'gg', 'sv'))
             )
 
             # Total score calculation
@@ -303,10 +354,24 @@ class PokemonTCGClient:
             if num_query:
                 q_clean = num_query.upper().strip()
                 c_clean = card_number.upper().strip()
-                if c_clean == q_clean:
+                q_digits = re.sub(r'\D', '', q_clean).lstrip("0") or "0"
+                c_digits = re.sub(r'\D', '', c_clean).lstrip("0") or "0"
+
+                if c_clean == q_clean or (c_clean.lstrip("0") == q_clean.lstrip("0") and c_clean.lstrip("0")):
                     num_score = 100.0
-                elif c_clean.lstrip("0") == q_clean.lstrip("0") and c_clean.lstrip("0"):
+                elif (
+                    (q_clean.startswith("SVP") and set_id == "svp")
+                    or (q_clean.startswith("SWSH") and set_id.startswith("swsh"))
+                    or (q_clean.startswith("SM") and set_id.startswith("sm"))
+                    or (q_clean.startswith("XY") and set_id.startswith("xy"))
+                    or (q_clean.startswith("BW") and set_id.startswith("bw"))
+                    or (q_clean.startswith("TG") and set_id.endswith("tg"))
+                    or (q_clean.startswith("GG") and set_id.endswith("gg"))
+                    or (q_clean.startswith("SV") and (set_id.endswith("sv") or set_id == "sma"))
+                ) and (q_digits == c_digits):
                     num_score = 100.0
+                elif c_digits == q_digits and (is_special_subset or not target_total_raw):
+                    num_score = 95.0
                 elif c_clean.endswith(q_clean) or q_clean.endswith(c_clean):
                     num_score = 80.0
 
@@ -430,8 +495,9 @@ class PokemonTCGClient:
             card_number_str   = str(best_match.get("number", ""))
             printed_total_str = str(best_match.get("set", {}).get("printedTotal", ""))
 
-            if target_num_raw and len(target_num_raw) >= 3 and len(card_number_str) < 3:
-                formatted_num = card_number_str.zfill(len(target_num_raw))
+            target_num_digits = re.sub(r'\D', '', target_num_raw) if target_num_raw else ""
+            if target_num_digits and len(target_num_digits) >= 3 and len(card_number_str) < len(target_num_digits) and card_number_str.isdigit():
+                formatted_num = card_number_str.zfill(len(target_num_digits))
             else:
                 formatted_num = card_number_str
 

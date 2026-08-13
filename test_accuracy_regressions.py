@@ -134,6 +134,15 @@ class TestPrintedIDPipeline(unittest.TestCase):
             ("SV124/198", "SV124/198"),
             ("TG01/TG30", "TG01/TG30"),
             ("SV01a", "SV01A"),
+            ("SVP 035", "SVP035"),
+            ("SVP035", "SVP035"),
+            ("[SVP EN] 035", "SVP035"),
+            ("G [SVP EN] 035", "SVP035"),
+            ("SVPE 035", "SVP035"),
+            ("SWSH 050", "SWSH050"),
+            ("SWSH050", "SWSH050"),
+            ("SM210", "SM210"),
+            ("151/165", "151/165"),
         ]
         for text, expected in cases:
             parsed, conf, pattern = self.parser.parse_printed_id(text)
@@ -145,6 +154,8 @@ class TestPrintedIDPipeline(unittest.TestCase):
             ("X0124", "XY124"),   # 'O' -> 'Y' in Promo prefix
             ("XY I24", "XY124"),  # 'I' -> '1' in numeric slot
             ("S5050", "SWSH050"), # '5' -> 'W' in SWSH prefix
+            ("5VP 035", "SVP035"),
+            ("SVP O35", "SVP035"),
         ]
         for text, expected in cases:
             parsed, conf, pattern = self.parser.parse_printed_id(text)
@@ -178,11 +189,11 @@ class TestSampleXY124Card(unittest.TestCase):
         cls.extractor = PokemonCardExtractor(gpu=False)
 
     def test_xy124_extraction(self):
-        result = self.extractor.extract_from_image(self.image)
+        result = self.extractor.extract_from_image(self.image, save_debug=True)
         self.assertEqual(result["name"], "Pikachu ex")
         self.assertEqual(result["hp"], 130)
         self.assertEqual(result["normalized_printed_id"], "XY124")
-        self.assertEqual(result["printed_id_roi_source"], "footer_right")
+        self.assertTrue(result["printed_id_roi_source"].startswith("footer_right"))
         self.assertEqual(result["status"], "accepted")
         self.assertEqual(result["reason"], "success")
         self.assertTrue(os.path.exists(result["debug_crop_path"]))
@@ -190,4 +201,5 @@ class TestSampleXY124Card(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
 

@@ -190,9 +190,11 @@ class PokemonCardExtractor:
         """
         Crops ROIs for OCR using normalized coordinates relative to the rectified card:
         - Header (Name & HP): ymin=0.00, ymax=0.18, xmin=0.00, xmax=1.00
-        - Footer Left (Standard ID): ymin=0.84, ymax=0.98, xmin=0.02, xmax=0.55
-        - Footer Right (Promo/XY ID): ymin=0.84, ymax=0.98, xmin=0.50, xmax=0.97
-        - Footer Wide (Full bottom context): ymin=0.75, ymax=0.98, xmin=0.02, xmax=0.98
+        - Footer Left Surgical (Tight bottom-band for standard fraction / SVP promo): ymin=0.88, ymax=0.985, xmin=0.015, xmax=0.50
+        - Footer Left (Standard ID & illustrator context): ymin=0.83, ymax=0.985, xmin=0.015, xmax=0.55
+        - Footer Right Surgical (Tight bottom-band for SWSH/XY/BW promo): ymin=0.88, ymax=0.985, xmin=0.50, xmax=0.985
+        - Footer Right (Promo/XY ID): ymin=0.83, ymax=0.985, xmin=0.48, xmax=0.985
+        - Footer Wide (Full bottom context): ymin=0.86, ymax=0.985, xmin=0.02, xmax=0.98
         """
         h, w = card_img.shape[:2]
 
@@ -202,17 +204,21 @@ class PokemonCardExtractor:
             return card_img[y1:y2, x1:x2]
 
         header_crop = crop_norm(0.00, 0.18, 0.00, 1.00)
-        footer_left_crop = crop_norm(0.84, 0.98, 0.02, 0.55)
-        footer_right_crop = crop_norm(0.84, 0.98, 0.50, 0.97)
-        footer_wide_crop = crop_norm(0.75, 0.98, 0.02, 0.98)
+        footer_left_surgical = crop_norm(0.88, 0.985, 0.015, 0.50)
+        footer_left_crop = crop_norm(0.83, 0.985, 0.015, 0.55)
+        footer_right_surgical = crop_norm(0.88, 0.985, 0.50, 0.985)
+        footer_right_crop = crop_norm(0.83, 0.985, 0.48, 0.985)
+        footer_wide_crop = crop_norm(0.86, 0.985, 0.02, 0.98)
 
         return {
             "header": header_crop,
+            "footer_left_surgical": footer_left_surgical,
             "footer_left": footer_left_crop,
+            "footer_right_surgical": footer_right_surgical,
             "footer_right": footer_right_crop,
             "footer_wide": footer_wide_crop,
-            "footer_tight": footer_left_crop,  # backward compatibility alias
-            "footer": footer_wide_crop,         # backward compatibility alias
+            "footer_tight": footer_left_surgical,
+            "footer": footer_wide_crop,
         }
 
     def save_debug_roi_image(
@@ -229,35 +235,104 @@ class PokemonCardExtractor:
 
         rois_to_draw = [
             (0.00, 0.18, 0.00, 1.00, (255, 0, 0), "HEADER (0.00-0.18)"),
-            (0.84, 0.98, 0.02, 0.55, (0, 255, 0), "FOOTER_LEFT (0.84-0.98, 0.02-0.55)"),
-            (0.84, 0.98, 0.50, 0.97, (0, 0, 255), "FOOTER_RIGHT (0.84-0.98, 0.50-0.97)"),
+            (0.88, 0.985, 0.015, 0.50, (0, 255, 0), "FOOTER_LEFT_SURGICAL (0.88-0.985, 0.015-0.50)"),
+            (0.83, 0.985, 0.015, 0.55, (0, 200, 100), "FOOTER_LEFT (0.83-0.985, 0.015-0.55)"),
+            (0.88, 0.985, 0.50, 0.985, (0, 0, 255), "FOOTER_RIGHT_SURGICAL (0.88-0.985, 0.50-0.985)"),
+            (0.83, 0.985, 0.48, 0.985, (100, 0, 200), "FOOTER_RIGHT (0.83-0.985, 0.48-0.985)"),
         ]
 
         for ymin, ymax, xmin, xmax, color, label in rois_to_draw:
             pt1 = (int(w * xmin), int(h * ymin))
             pt2 = (int(w * xmax), int(h * ymax))
             cv2.rectangle(debug_img, pt1, pt2, color, 2)
-            cv2.putText(debug_img, label, (pt1[0] + 5, pt1[1] + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+            cv2.putText(debug_img, label, (pt1[0] + 5, pt1[1] + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.40, color, 1)
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         cv2.imwrite(output_path, debug_img)
         return output_path
 
+    def save_all_debug_pipeline_images(
+        self,
+        raw_image: np.ndarray,
+        warped_card: np.ndarray,
+        rois: Dict[str, np.ndarray],
+        output_dir: str = "debug_crops/latest",
+    ) -> Dict[str, str]:
+        """
+        Persists all stages of image transformation after client uploads:
+        1. 01_raw_upload.png - Unmodified incoming client frame
+        2. 02_warped_card.png - Dewarped rectified card
+        3. 03_rectified_rois.png - Bounding box visualization across header and footer strips
+        4. variant_{roi}_{filter}.png - Every manipulated preprocessing variant for OCR
+        """
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Clear previous run images in output_dir
+        for item in os.listdir(output_dir):
+            item_path = os.path.join(output_dir, item)
+            if os.path.isfile(item_path) and item.lower().endswith((".png", ".jpg", ".jpeg")):
+                try:
+                    os.remove(item_path)
+                except OSError:
+                    pass
+
+        saved_files = {}
+
+        # 1. Raw upload
+        if raw_image is not None and raw_image.size > 0:
+            raw_path = os.path.join(output_dir, "01_raw_upload.png")
+            cv2.imwrite(raw_path, raw_image)
+            saved_files["raw_upload"] = raw_path
+
+        # 2. Warped card
+        if warped_card is not None and warped_card.size > 0:
+            warped_path = os.path.join(output_dir, "02_warped_card.png")
+            cv2.imwrite(warped_path, warped_card)
+            saved_files["warped_card"] = warped_path
+
+            # 3. Rectified ROIs visualizer
+            roi_vis_path = os.path.join(output_dir, "03_rectified_rois.png")
+            self.save_debug_roi_image(warped_card, output_path=roi_vis_path)
+            saved_files["rectified_rois"] = roi_vis_path
+
+        # 4. All manipulated preprocessing variants for each ROI
+        for roi_name, roi_img in rois.items():
+            if roi_name in ("footer_tight", "footer"):
+                continue  # skip duplicate aliases
+            if roi_img is None or roi_img.size == 0:
+                continue
+
+            variants = self.generate_preprocessing_variants(roi_img)
+            for var_name, var_img in variants.items():
+                if var_img is not None and var_img.size > 0:
+                    var_file_name = f"variant_{roi_name}_{var_name}.png"
+                    var_path = os.path.join(output_dir, var_file_name)
+                    cv2.imwrite(var_path, var_img)
+                    saved_files[f"{roi_name}_{var_name}"] = var_path
+
+        return saved_files
+
     def generate_preprocessing_variants(self, crop: np.ndarray) -> Dict[str, np.ndarray]:
         """
-        Takes crop BEFORE aggressive resizing/compression.
-        Upscales crop 4x using INTER_CUBIC, then generates 6 preprocessing variants:
-        - original_color
+        Takes crop and upscales to ensure target character height >= 36-48px.
+        Generates dynamic polarity and morphology-aware preprocessing variants:
+        - original_color / orig
         - grayscale_norm
         - clahe
+        - blackhat / inv_th_bh (for gold foil / dark text on bright foil)
+        - tophat / th_tophat (for light text on dark backgrounds)
+        - dark_text_light_bg (Otsu)
+        - light_text_dark_bg (Inv-Otsu)
         - adaptive_thresh
-        - dark_text_light_bg
-        - light_text_dark_bg
         """
         if crop is None or crop.size == 0:
             return {}
 
-        upscaled = cv2.resize(crop, (crop.shape[1] * 4, crop.shape[0] * 4), interpolation=cv2.INTER_CUBIC)
+        ch, cw = crop.shape[:2]
+        scale = max(2.5, 42.0 / max(ch / 2.5, 8.0))
+        target_w = int(cw * scale)
+        target_h = int(ch * scale)
+        upscaled = cv2.resize(crop, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
 
         gray = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY) if len(upscaled.shape) == 3 else upscaled.copy()
         norm_gray = cv2.normalize(gray, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
@@ -265,21 +340,40 @@ class PokemonCardExtractor:
         clahe_engine = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         clahe_gray = clahe_engine.apply(norm_gray)
 
-        adaptive_thresh = cv2.adaptiveThreshold(
-            clahe_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 4
-        )
-
-        _, dark_text = cv2.threshold(clahe_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        light_text = cv2.bitwise_not(dark_text)
-
-        return {
+        variants = {
             "original_color": upscaled,
             "grayscale_norm": cv2.cvtColor(norm_gray, cv2.COLOR_GRAY2BGR),
             "clahe": cv2.cvtColor(clahe_gray, cv2.COLOR_GRAY2BGR),
-            "adaptive_thresh": cv2.cvtColor(adaptive_thresh, cv2.COLOR_GRAY2BGR),
-            "dark_text_light_bg": cv2.cvtColor(dark_text, cv2.COLOR_GRAY2BGR),
-            "light_text_dark_bg": cv2.cvtColor(light_text, cv2.COLOR_GRAY2BGR),
         }
+
+        # Adaptive threshold
+        adaptive_thresh = cv2.adaptiveThreshold(
+            clahe_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 4
+        )
+        variants["adaptive_thresh"] = cv2.cvtColor(adaptive_thresh, cv2.COLOR_GRAY2BGR)
+
+        # Black-Hat Morphology (crucial for gold/foil cards like Mega Greninja)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+        bh = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+        bh_norm = cv2.normalize(bh, None, 0, 255, cv2.NORM_MINMAX)
+        _, th_bh = cv2.threshold(bh_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants["blackhat"] = cv2.cvtColor(255 - bh_norm, cv2.COLOR_GRAY2BGR)
+        variants["inv_th_bh"] = cv2.cvtColor(255 - th_bh, cv2.COLOR_GRAY2BGR)
+
+        # Top-Hat Morphology (for dark background foil)
+        th = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
+        th_norm = cv2.normalize(th, None, 0, 255, cv2.NORM_MINMAX)
+        _, th_th = cv2.threshold(th_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants["tophat"] = cv2.cvtColor(255 - th_norm, cv2.COLOR_GRAY2BGR)
+        variants["th_tophat"] = cv2.cvtColor(255 - th_th, cv2.COLOR_GRAY2BGR)
+
+        # Otsu thresholding
+        _, dark_text = cv2.threshold(clahe_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        light_text = cv2.bitwise_not(dark_text)
+        variants["dark_text_light_bg"] = cv2.cvtColor(dark_text, cv2.COLOR_GRAY2BGR)
+        variants["light_text_dark_bg"] = cv2.cvtColor(light_text, cv2.COLOR_GRAY2BGR)
+
+        return variants
 
     def _enhance_roi(self, roi: np.ndarray) -> np.ndarray:
         """
@@ -567,16 +661,16 @@ class PokemonCardExtractor:
         candidates = []
 
         # 1. Special Subset Alphanumeric Patterns (e.g., "TG01/TG30", "GG12/70", "RC01/RC25", "SV01/SV94")
-        subset_matches = re.finditer(r'\b([A-Za-z]{1,3}\d{1,4})\s*/\s*([A-Za-z]{0,3}\d{1,4})\b', fixed_text)
+        subset_matches = re.finditer(r'\b(TG|GG|SV|RC|CRZ|H|SH|SL|CL)(\d{1,4})\s*/\s*([A-Za-z]{0,3}\d{1,4})\b', fixed_text, re.IGNORECASE)
         for match in subset_matches:
-            candidates.append((90.0, f"{match.group(1).upper()}/{match.group(2).upper()}"))
+            candidates.append((90.0, f"{match.group(1).upper()}{match.group(2)}/{match.group(3).upper()}"))
 
         # 2. Promo Cards (e.g., "SWSH050", "SWSH 050", "SVP025", "SVP 025", "SM210", "XY100")
         promo_matches = re.finditer(r'\b(SWSH|SVP|SM|XY|BW|HGSS|DP|S-P|SV-P|PROMO)\s*(\d{2,4})\b', fixed_text, re.IGNORECASE)
         for match in promo_matches:
             prefix = match.group(1).upper()
             digits = "".join([self.char_fix_map.get(c, c) for c in match.group(2)])
-            candidates.append((85.0, f"{prefix}{digits}"))
+            candidates.append((95.0, f"{prefix}{digits}"))
 
         # 3. Numeric Card ID Patterns (including Secret Rares / SIRs like "199/165", "251/198")
         pattern = r'(\d{1,4})[a-zA-Z]{0,2}\s*/\s*([0-9sSBOIl|]{1,4})'
@@ -588,7 +682,7 @@ class PokemonCardExtractor:
             if num_raw.isdigit() and total_raw.isdigit():
                 num_val = int(num_raw)
                 total_val = int(total_raw)
-                if 0 < num_val <= 999 and 0 < total_val <= 999:
+                if 0 < num_val <= 999 and 10 <= total_val <= 999:
                     corrected_total = self._correct_set_total(total_raw)
                     corrected_num = num_raw
                     if len(num_raw) == 3 and num_raw.startswith('4'):
@@ -616,7 +710,7 @@ class PokemonCardExtractor:
         fixed = re.sub(r'[^a-zA-Z\s\'-]', '', fixed).strip()
         return fixed
 
-    def extract_from_image(self, image_np: np.ndarray) -> Dict[str, Any]:
+    def extract_from_image(self, image_np: np.ndarray, save_debug: bool = False) -> Dict[str, Any]:
         """
         Full extraction pipeline: YOLO / Dewarping → ROI crop → 6-variant enhance → OCR → parse.
         Uses YOLO bounding box detections if confident; falls back to contour-based dewarping + ratio crop.
@@ -639,8 +733,12 @@ class PokemonCardExtractor:
             warped = self.preprocess_and_warp(image_np)
             rois = self.crop_rois(warped)
 
-        # 1. Save debug ROI crop visualization
-        debug_crop_path = self.save_debug_roi_image(warped, output_path="debug_crops/debug_rectified_roi.png")
+        # 1. Optionally save complete debug images after client sends upload
+        debug_crop_path = ""
+        debug_files: Dict[str, str] = {}
+        if save_debug:
+            debug_files = self.save_all_debug_pipeline_images(image_np, warped, rois, output_dir="debug_crops/latest")
+            debug_crop_path = debug_files.get("rectified_rois", "debug_crops/latest/03_rectified_rois.png")
 
         # 2. Header Extraction
         header_variants = self._ocr_variants(rois["header"], field_type="header")
@@ -664,18 +762,20 @@ class PokemonCardExtractor:
         hp = self._modal_value(hp_candidates)
         header_text = "\n--- OCR PASS ---\n".join(header_texts)
 
-        # 3. Printed ID Extraction with 6 Preprocessing Variants & Multiple Footer ROIs
+        # 3. Printed ID Extraction with Morphology Variants & Multi-Path Footer ROIs
         raw_ocr_outputs: Dict[str, str] = {}
         id_observations: List[str] = []
         printed_id_roi_source: str = "none"
         collector_id: Optional[str] = None
         parsed_candidates: List[Tuple[float, str, str]] = []
 
-        id_allowlist = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/- "
+        id_allowlist = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/- :[]|"
         eval_rois = [
-            ("footer_left", rois["footer_left"]),
-            ("footer_right", rois["footer_right"]),
-            ("footer_wide", rois["footer_wide"]),
+            ("footer_left_surgical", rois.get("footer_left_surgical")),
+            ("footer_left", rois.get("footer_left")),
+            ("footer_right_surgical", rois.get("footer_right_surgical")),
+            ("footer_right", rois.get("footer_right")),
+            ("footer_wide", rois.get("footer_wide")),
         ]
 
         for roi_name, roi_crop in eval_rois:
@@ -706,16 +806,32 @@ class PokemonCardExtractor:
                 if parsed_id:
                     id_observations.append(parsed_id)
                     score = conf
-                    if pattern in ("standard_fraction", "subset_fraction", "of_fraction") and roi_name == "footer_left":
-                        score += 0.05
-                    elif pattern == "promo_prefix" and roi_name == "footer_right":
-                        score += 0.05
+                    # Path weighting:
+                    if "surgical" in roi_name:
+                        score += 0.10
+                    if pattern in ("standard_fraction", "subset_fraction", "of_fraction"):
+                        if "left" in roi_name:
+                            score += 0.15
+                        elif "right" in roi_name:
+                            score -= 0.10
+                    elif pattern == "promo_prefix":
+                        if parsed_id.startswith("SVP"):
+                            if "left" in roi_name:
+                                score += 0.15
+                        elif "right" in roi_name:
+                            score += 0.15
                     parsed_candidates.append((score, parsed_id, roi_name))
 
-        if parsed_candidates:
-            parsed_candidates.sort(key=lambda x: x[0], reverse=True)
-            collector_id = parsed_candidates[0][1]
-            printed_id_roi_source = parsed_candidates[0][2]
+        candidate_scores: Counter = Counter()
+        candidate_sources: Dict[str, str] = {}
+        for score, parsed_id, roi_name in parsed_candidates:
+            candidate_scores[parsed_id] += score
+            if parsed_id not in candidate_sources:
+                candidate_sources[parsed_id] = roi_name
+
+        if candidate_scores:
+            collector_id = candidate_scores.most_common(1)[0][0]
+            printed_id_roi_source = candidate_sources.get(collector_id, "footer_left")
         elif id_observations:
             collector_id = self._modal_value(id_observations)
 
@@ -762,6 +878,7 @@ class PokemonCardExtractor:
             "printed_id_roi_source": printed_id_roi_source,
             "raw_ocr_outputs": raw_ocr_outputs,
             "debug_crop_path": debug_crop_path,
+            "debug_files": debug_files,
             "status": status,
             "reason": reason,
             "header_raw_ocr": header_text,

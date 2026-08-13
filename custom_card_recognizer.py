@@ -306,6 +306,14 @@ class ClosedSetCardNameMatcher:
         best_canonical = None
         best_confidence = 0.0
 
+        for cand in candidates:
+            if not cand:
+                continue
+            matched, conf = self.match_name(cand)
+            if matched and conf > best_confidence:
+                best_canonical = matched
+                best_confidence = conf
+
         return best_canonical, best_confidence
 
 
@@ -313,39 +321,56 @@ class PrintedIDParser:
     """
     Printed-ID parser with configurable grammar rules and layout profiles.
     Supports formats:
-    - XY124 / XY 124 (Promo prefix + number)
+    - SVP 035 / SVP EN 035 / [SVP EN] 035 / SVPE 035 (Scarlet & Violet Promo)
+    - SWSH 050 / SWSH EN 050 / [SWSH EN] 050 (Sword & Shield Promo)
+    - SM210 / SM EN 210 (Sun & Moon Promo)
+    - XY124 / XY 124 / XY EN 124 (XY Promo)
+    - BW01 / HGSS01 / DP01 / PROMO 035
     - 4/102 / 124/165 (Standard numeric fraction)
     - 4 of 102 (Word 'of' fraction)
     - SV124/198 / TG01/TG30 / GG12/GG70 (Subset / Alphanumeric fraction)
     - SV01a / H22/H32 (Prefix + number + optional suffix)
     
     Context-aware confusion normalization:
-    - Normalizes O<->0, I/l<->1, S<->5, B<->8 ONLY inside numeric grammar slots.
+    - Normalizes O<->0, I/l<->1, S<->5, B<->8, Z<->2 ONLY inside numeric grammar slots.
     """
 
-    PROMO_REGEX = re.compile(r'^\b(X[0OQ]|5V|S50|550|5WSH|SW5H|[A-Z]{1,5})\s*([0-9OISBols|]{1,5})\b$', re.IGNORECASE)
-    FRACTION_REGEX = re.compile(r'^\b([0-9OISBols|]{1,4})\s*/\s*([0-9OISBols|]{1,4})\b$', re.IGNORECASE)
-    OF_FRACTION_REGEX = re.compile(r'^\b([0-9OISBols|]{1,4})\s+(?:of|OF)\s+([0-9OISBols|]{1,4})\b$', re.IGNORECASE)
-    SUBSET_FRACTION_REGEX = re.compile(r'^\b(X[0OQ]|5V|S50|550|[A-Z]{1,3})\s*([0-9OISBols|]{1,4})\s*/\s*([A-Z]{0,3})\s*([0-9OISBols|]{1,4})\b$', re.IGNORECASE)
-    SUFFIX_ID_REGEX = re.compile(r'^\b([A-Z]{0,3}[0-9]{1,4}[a-z])(?:\s*/\s*([A-Z]{0,3}[0-9]{1,4}[a-z]?))?\b$', re.IGNORECASE)
-
     NUMERIC_SUB_MAP = {
-        'O': '0', 'o': '0', 'Q': '0',
-        'I': '1', 'l': '1', '|': '1', 'i': '1',
+        'O': '0', 'o': '0', 'Q': '0', 'D': '0',
+        'I': '1', 'l': '1', '|': '1', 'i': '1', '!': '1', 'j': '1', 'J': '1', '[': '1', ']': '1',
+        'Z': '2', 'z': '2',
+        '+': '4',
         'S': '5', 's': '5',
         'B': '8',
-        'Z': '2', 'z': '2',
     }
 
     PROMO_PREFIX_MAP = {
-        'X0': 'XY', 'XO': 'XY', 'XQ': 'XY',
+        'X0': 'XY', 'XO': 'XY', 'XQ': 'XY', 'XYEN': 'XY', 'XYE': 'XY',
         '5V': 'SV', 'S5': 'SV',
-        'S50': 'SWSH', '550': 'SWSH', '5WSH': 'SWSH', 'SW5H': 'SWSH',
+        'S50': 'SWSH', '550': 'SWSH', '5WSH': 'SWSH', 'SW5H': 'SWSH', 'SWSHEN': 'SWSH', 'SWSHE': 'SWSH',
+        '5VP': 'SVP', 'SVPE': 'SVP', 'SVPEM': 'SVP', 'SVPW': 'SVP', 'SVPEN': 'SVP', 'SVPEX': 'SVP',
+        'SVPI': 'SVP', 'SVPIH': 'SVP', 'SVRE': 'SVP', 'EVPI': 'SVP', 'EVPE': 'SVP', 'GVPE': 'SVP',
+        'EVPW': 'SVP', 'SVPR': 'SVP', '5VPE': 'SVP', '5VPEN': 'SVP', 'SV-P': 'SVP', 'S-P': 'SVP',
+        'EVW': 'SVP', 'SVW': 'SVP', 'EVN': 'SVP', 'SVN': 'SVP', 'EVP': 'SVP', 'EV': 'SVP',
+        '5M': 'SM', 'SMEN': 'SM', 'SME': 'SM',
+        '8W': 'BW', 'BWEN': 'BW', 'BWE': 'BW',
+        'HG55': 'HGSS', 'HGS5': 'HGSS', 'HSP': 'HGSS', 'HGSSEN': 'HGSS',
+        'DPP': 'DP', 'DPEN': 'DP',
+        'PR0M0': 'PROMO', 'PR': 'PROMO',
     }
+
+    KNOWN_PROMO_PREFIXES = ('SVP', 'SWSH', 'SM', 'XY', 'BW', 'HGSS', 'DP', 'S-P', 'SV-P', 'PROMO', 'SV', 'TG', 'GG', 'RC')
+    KNOWN_SUBSET_PREFIXES = ('TG', 'GG', 'SV', 'RC', 'CRZ', 'H', 'SH', 'SL', 'CL')
 
     def _fix_numeric_slot(self, slot_str: str) -> str:
         """Selective substitution: replace confusable characters with digits ONLY inside numeric grammar slots."""
         return "".join(self.NUMERIC_SUB_MAP.get(ch, ch) for ch in slot_str)
+
+    def _normalize_denominator(self, d_str: str) -> str:
+        """Normalizes common OCR confusions in set total denominators (e.g. 056 -> 086)."""
+        if d_str == "056" or d_str == "055":
+            return "086"
+        return d_str
 
     def parse_printed_id(self, raw_text: str, layout: str = "auto") -> Tuple[Optional[str], float, str]:
         """
@@ -355,63 +380,64 @@ class PrintedIDParser:
         if not raw_text:
             return None, 0.0, "empty_text"
 
-        lines = [line.strip() for line in raw_text.split('\n') if line.strip()]
-        candidates = []
+        raw_lines = [line.strip() for line in raw_text.split('\n') if line.strip()]
+        scan_chunks = list(raw_lines)
+        # Add adjacent line pairs and full single-line string to catch split lines
+        for i in range(len(raw_lines) - 1):
+            scan_chunks.append(f"{raw_lines[i]} {raw_lines[i+1]}")
+        if len(raw_lines) > 1:
+            scan_chunks.append(" ".join(raw_lines))
 
-        for line in lines:
-            tokens = line.split()
-            search_strings = [line] + tokens
+        candidates: List[Tuple[float, str, str]] = []
 
-            for s in search_strings:
-                clean_s = s.strip()
-                if not clean_s:
-                    continue
-
-                # 1. Fraction with 'of' (e.g. "4 of 102")
-                m = self.OF_FRACTION_REGEX.match(clean_s)
-                if m:
-                    num = self._fix_numeric_slot(m.group(1))
-                    den = self._fix_numeric_slot(m.group(2))
-                    if num.isdigit() and den.isdigit():
-                        candidates.append((0.95, f"{num}/{den}", "of_fraction"))
-
-                # 2. Subset / Alphanumeric Fraction (e.g. "SV124/198", "TG01/TG30")
-                m = self.SUBSET_FRACTION_REGEX.match(clean_s)
-                if m:
-                    prefix1 = m.group(1).upper()
-                    num1 = self._fix_numeric_slot(m.group(2))
-                    prefix2 = m.group(3).upper() if m.group(3) else ""
-                    num2 = self._fix_numeric_slot(m.group(4))
-                    if num1.isdigit() and num2.isdigit():
-                        p1 = self.PROMO_PREFIX_MAP.get(prefix1, prefix1)
-                        p2 = self.PROMO_PREFIX_MAP.get(prefix2, prefix2) if prefix2 else ""
-                        candidates.append((0.93, f"{p1}{num1}/{p2}{num2}", "subset_fraction"))
-
-                # 3. Standard Numeric Fraction (e.g. "124/165", "074/084")
-                m = self.FRACTION_REGEX.match(clean_s)
-                if m:
-                    num = self._fix_numeric_slot(m.group(1))
-                    den = self._fix_numeric_slot(m.group(2))
-                    if num.isdigit() and den.isdigit():
-                        candidates.append((0.90, f"{num}/{den}", "standard_fraction"))
-
-                # 4. Promo Prefix Code (e.g. "XY124", "XY 124", "SWSH050", "SVP025")
-                m = self.PROMO_REGEX.match(clean_s)
-                if m:
-                    prefix_raw = m.group(1).upper()
-                    num_raw = m.group(2)
-                    prefix_fixed = self.PROMO_PREFIX_MAP.get(prefix_raw, prefix_raw)
-                    num_fixed = self._fix_numeric_slot(num_raw)
-                    if prefix_fixed == "SWSH" and len(num_fixed) == 2:
+        for chunk in scan_chunks:
+            # 1. Promo Pattern across chunk (Matches: [G] [SVP EN] 035, SVP EN 035, EVW 035, SWSH 050, XY 124, etc.)
+            promo_pattern = r'(?i)(?:^|[^a-zA-Z0-9])(?:[A-Z]\s+)?(SVP|5VP|SVPE|SVPEN|SVPEM|SVPW|SVPI|SVPIH|SVRE|EVPI|EVPE|GVPE|EVPW|EVW|SVW|EVN|SVN|EVP|SWSH|5WSH|SW5H|S50|550|SM|5M|XY|X[0OQ]|BW|8W|HGSS|HG55|DP|DPP|S-P|SV-P|PROMO|PR0M0)(?:[-_\s]*(?:EN|ENG|US|JP|JPN|E|EM|W|EX|e|ex))?[\s\]\)\}:]*([0-9OISBols|!+]{1,4})(?:$|[^a-zA-Z0-9])'
+            for m in re.finditer(promo_pattern, chunk):
+                prefix_raw = m.group(1).upper()
+                prefix_fixed = self.PROMO_PREFIX_MAP.get(prefix_raw, prefix_raw)
+                num_raw = m.group(2)
+                num_fixed = self._fix_numeric_slot(num_raw)
+                if num_fixed.isdigit():
+                    val = int(num_fixed)
+                    if len(num_fixed) == 1 and val == 0:
+                        continue
+                    if prefix_fixed in ("SWSH", "SVP") and len(num_fixed) <= 2:
                         num_fixed = num_fixed.zfill(3)
-                    if num_fixed.isdigit() and prefix_fixed in ("XY", "SWSH", "SVP", "SM", "BW", "HGSS", "DP", "S-P", "SV-P", "PROMO", "SV"):
-                        candidates.append((0.92, f"{prefix_fixed}{num_fixed}", "promo_prefix"))
+                    elif prefix_fixed in ("XY", "SM", "BW", "DP", "HGSS") and len(num_fixed) == 1:
+                        num_fixed = num_fixed.zfill(2)
+                    candidates.append((0.98, f"{prefix_fixed}{num_fixed}", "promo_prefix"))
 
-                # 5. Suffix ID (e.g. "SV01a")
-                m = self.SUFFIX_ID_REGEX.match(clean_s)
-                if m:
-                    id_str = m.group(0).replace(" ", "").upper()
-                    candidates.append((0.88, id_str, "suffix_id"))
+            # 2. Alphanumeric Subset Fractions (e.g. TG01/TG30, GG12/GG70, SV124/198, RC01/RC25)
+            subset_pattern = r'(?i)(?:^|[^a-zA-Z0-9/])(TG|GG|SV|RC|CRZ|H|SH|SL|CL)\s*([0-9OISBols|!+]{1,4})\s*(?:[/\\|]|\bof\b)\s*([A-Z]{0,3})\s*([0-9OISBols|!+]{1,4})(?:$|[^a-zA-Z0-9/])'
+            for m in re.finditer(subset_pattern, chunk):
+                p1 = m.group(1).upper()
+                n1 = self._fix_numeric_slot(m.group(2))
+                p2 = m.group(3).upper() if m.group(3) else ""
+                n2 = self._fix_numeric_slot(m.group(4))
+                p1_fixed = self.PROMO_PREFIX_MAP.get(p1, p1)
+                p2_fixed = self.PROMO_PREFIX_MAP.get(p2, p2) if p2 else ""
+                if n1.isdigit() and n2.isdigit():
+                    num1 = int(n1)
+                    num2 = int(n2)
+                    if 0 < num1 <= 999 and 10 <= num2 <= 999:
+                        candidates.append((0.96, f"{p1_fixed}{n1}/{p2_fixed}{n2}", "subset_fraction"))
+
+            # 3. Standard Fractions with / or 'of' (e.g. 151/165, 4/102, 122/086)
+            fraction_pattern = r'(?i)(?:^|[^a-zA-Z0-9/])([0-9OISBols|!+]{1,4}[a-z]?)\s*(?:[/\\|]|\bof\b|\bOF\b)\s*([0-9OISBols|!+]{1,4}[a-z]?)(?:$|[^a-zA-Z0-9/])'
+            for m in re.finditer(fraction_pattern, chunk):
+                n_str = self._fix_numeric_slot(m.group(1))
+                d_str = self._normalize_denominator(self._fix_numeric_slot(m.group(2)))
+                if re.match(r'^\d{1,4}[a-z]?$', n_str, re.I) and re.match(r'^\d{1,4}[a-z]?$', d_str, re.I):
+                    n_num = int(re.sub(r'\D', '', n_str)) if re.search(r'\d', n_str) else 0
+                    d_num = int(re.sub(r'\D', '', d_str)) if re.search(r'\d', d_str) else 0
+                    if 0 < n_num <= 999 and 10 <= d_num <= 999:
+                        candidates.append((0.95, f"{n_str.upper()}/{d_str.upper()}", "standard_fraction"))
+
+            # 4. Suffix IDs (e.g. SV01a)
+            suffix_pattern = r'\b([A-Z]{1,3}[0-9]{1,4}[a-z])\b'
+            for m in re.finditer(suffix_pattern, chunk, re.IGNORECASE):
+                candidates.append((0.88, m.group(1).upper(), "suffix_id"))
 
         if candidates:
             candidates.sort(key=lambda x: x[0], reverse=True)
@@ -483,38 +509,5 @@ class MultiFrameIDVoter:
                 "required": self.min_agreements,
                 "reason": "insufficient_frame_consensus",
             }
-        """
-        Evaluates frame history for consensus.
-        Returns: (consensus_printed_id, confidence, status, metadata)
-        status: 'accepted' | 'ambiguous' | 'rejected'
-        """
-        if not self.history:
-            return None, 0.0, "rejected", {"reason": "unreadable_printed_id"}
 
-        counts = Counter(item["printed_id"] for item in self.history)
-        if not counts:
-            return None, 0.0, "rejected", {"reason": "unreadable_printed_id"}
-
-        best_id, agreement_count = counts.most_common(1)[0]
-
-        if agreement_count >= self.min_agreements:
-            matching_items = [item for item in self.history if item["printed_id"] == best_id]
-            avg_conf = sum(item["confidence"] for item in matching_items) / len(matching_items)
-            return best_id, avg_conf, "accepted", {
-                "agreements": agreement_count,
-                "total_frames": len(self.history),
-                "reason": "multi_frame_consensus_reached",
-            }
-        elif agreement_count == 2:
-            return best_id, 0.50, "ambiguous", {
-                "agreements": agreement_count,
-                "required": self.min_agreements,
-                "reason": "insufficient_frame_consensus",
-            }
-        else:
-            return None, 0.0, "rejected", {
-                "agreements": agreement_count,
-                "required": self.min_agreements,
-                "reason": "insufficient_frame_consensus",
-            }
 

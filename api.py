@@ -4,13 +4,16 @@ Exposes API endpoints for consumption by Flutter Mobile App.
 """
 
 import asyncio
+import os
 import time
 import cv2
 import logging
 import numpy as np
 from typing import Optional, Dict, Any, List
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 from pokemon_card_ocr import PokemonCardExtractor
@@ -26,11 +29,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("pokemon_tcg_api")
 
+# Ensure debug directory exists
+os.makedirs("debug_crops/latest", exist_ok=True)
+
 app = FastAPI(
     title="Pokémon TCG Card OCR API",
     description="Backend OCR and verification service for Flutter Mobile App",
     version="1.0.0"
 )
+
+# Mount debug crops static directory to serve images to client/browser
+app.mount("/debug_crops", StaticFiles(directory="debug_crops"), name="debug_crops")
 
 # Enable CORS for Flutter web / mobile cross-origin requests
 app.add_middleware(
@@ -216,14 +225,17 @@ async def scan_card_stream(files: List[UploadFile] = File(...)):
 
 
 @app.post("/api/v1/scan", response_model=CardScanResponse)
-async def scan_card(file: UploadFile = File(...)):
+async def scan_card(
+    file: UploadFile = File(...),
+    save_debug: bool = Query(True, description="Whether to persist all transformed pipeline images to debug_crops/latest"),
+):
     """
     Accepts an image upload (JPEG/PNG), extracts card text via OpenCV & EasyOCR,
     queries the Pokémon TCG API, and returns verified card metadata.
     """
     start_time = time.time()
     filename = file.filename or "unknown.jpg"
-    logger.info("📥 [/api/v1/scan] Received image upload: '%s' (content_type=%s)", filename, file.content_type)
+    logger.info("📥 [/api/v1/scan] Received image upload: '%s' (content_type=%s, save_debug=%s)", filename, file.content_type, save_debug)
 
     if not file.content_type or not file.content_type.startswith("image/"):
         logger.warning("⚠️ [/api/v1/scan] Rejected non-image upload: '%s' (%s)", filename, file.content_type)
@@ -250,12 +262,18 @@ async def scan_card(file: UploadFile = File(...)):
         logger.info("   [2/3 OCR Pipeline] Running OpenCV crop & EasyOCR text extraction...")
         ocr_start = time.time()
         async with inference_lock:
-            ocr_result = await run_in_threadpool(ocr_extractor.extract_from_image, image_np)
+            ocr_result = await run_in_threadpool(
+                ocr_extractor.extract_from_image, image_np, save_debug=save_debug
+            )
             ocr_ms = (time.time() - ocr_start) * 1000.0
 
         extracted_name = ocr_result.get("name")
         extracted_hp = ocr_result.get("hp")
         extracted_id = ocr_result.get("unique_id")
+        saved_debug_count = len(ocr_result.get("debug_files", {}))
+        if save_debug and saved_debug_count > 0:
+            logger.info("   [2/3 OCR Pipeline] Saved %d debug images to /debug_crops/latest", saved_debug_count)
+
         logger.info("   [2/3 OCR Pipeline] OCR completed in %.2f ms -> Extracted Name: '%s', HP: %s, ID: '%s'",
                     ocr_ms, extracted_name, extracted_hp, extracted_id)
 
@@ -320,6 +338,118 @@ async def scan_card(file: UploadFile = File(...)):
         )
 
 
+@app.get("/api/v1/debug/pipeline")
+def get_debug_pipeline_images():
+    """
+    Returns a list of all images currently saved in debug_crops/latest.
+    """
+    latest_dir = "debug_crops/latest"
+    if not os.path.exists(latest_dir):
+        return {"images": [], "count": 0}
+
+    images = []
+    for fname in sorted(os.listdir(latest_dir)):
+        if fname.lower().endswith((".png", ".jpg", ".jpeg")):
+            fpath = os.path.join(latest_dir, fname)
+            stat = os.stat(fpath)
+            images.append({
+                "name": fname,
+                "url": f"/debug_crops/latest/{fname}",
+                "size_bytes": stat.st_size,
+                "modified_time": stat.st_mtime
+            })
+
+    return {"images": images, "count": len(images)}
+
+
+@app.get("/debug", response_class=HTMLResponse)
+def debug_gallery_view():
+    """
+    Renders an HTML gallery to inspect the received raw upload and all manipulated OCR variants.
+    """
+    latest_dir = "debug_crops/latest"
+    files = sorted(os.listdir(latest_dir)) if os.path.exists(latest_dir) else []
+    image_files = [f for f in files if f.lower().endswith((".png", ".jpg", ".jpeg"))]
+
+    cards_html = ""
+    for img in image_files:
+        url = f"/debug_crops/latest/{img}?t={int(time.time() * 1000)}"
+        cards_html += f"""
+        <div style="background: #1e1e2e; border: 1px solid #313244; border-radius: 12px; padding: 16px; display: flex; flex-direction: column; align-items: center; box-shadow: 0 4px 12px rgba(0,0,0,0.3);">
+            <h4 style="color: #cdd6f4; margin: 0 0 12px 0; font-family: monospace; font-size: 14px; word-break: break-all; text-align: center;">{img}</h4>
+            <div style="max-height: 260px; overflow: auto; display: flex; justify-content: center; align-items: center; background: #11111b; border-radius: 8px; padding: 8px; width: 100%; box-sizing: border-box;">
+                <img src="{url}" alt="{img}" style="max-width: 100%; max-height: 240px; object-fit: contain; border-radius: 4px;" />
+            </div>
+            <a href="{url}" target="_blank" style="margin-top: 12px; color: #89b4fa; text-decoration: none; font-size: 13px; font-weight: bold;">View Full Size →</a>
+        </div>
+        """
+
+    if not cards_html:
+        cards_html = '<p style="color: #a6adc8; grid-column: 1 / -1; text-align: center; padding: 40px;">No debug images saved yet. Scan a card via the client or API to populate this view.</p>'
+
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Pokémon OCR Pipeline Debug Gallery</title>
+        <style>
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+                background-color: #11111b;
+                color: #cdd6f4;
+                margin: 0;
+                padding: 24px;
+            }}
+            .header {{
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                border-bottom: 1px solid #313244;
+                padding-bottom: 16px;
+                margin-bottom: 24px;
+            }}
+            .grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+                gap: 20px;
+            }}
+            .btn {{
+                background: #89b4fa;
+                color: #11111b;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 6px;
+                font-weight: bold;
+                cursor: pointer;
+                text-decoration: none;
+            }}
+            .btn:hover {{
+                background: #b4befe;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <div>
+                <h1 style="margin: 0; font-size: 24px; color: #89b4fa;">🔍 Pokémon OCR Debug Visualizer</h1>
+                <p style="margin: 4px 0 0 0; color: #a6adc8; font-size: 14px;">Raw client uploads and all manipulated preprocessing filter variants</p>
+            </div>
+            <div>
+                <button class="btn" onclick="location.reload()">🔄 Refresh Images</button>
+            </div>
+        </div>
+        <div class="grid">
+            {cards_html}
+        </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
+
