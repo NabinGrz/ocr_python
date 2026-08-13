@@ -14,7 +14,6 @@ import json
 import os
 import cv2
 import numpy as np
-import easyocr
 from collections import Counter
 from difflib import SequenceMatcher
 from typing import Dict, Any, Optional, List, Tuple
@@ -30,10 +29,8 @@ try:
 except ImportError:
     classify_frame_quality = None
 
-try:
-    from paddleocr import PaddleOCR
-except ImportError:
-    PaddleOCR = None
+# PaddleOCR is imported lazily inside paddle_ocr property to keep startup RAM minimal
+PaddleOCR = None
 
 from custom_card_recognizer import (
     RestrictedAlphabetRecognizer,
@@ -45,16 +42,13 @@ from custom_card_recognizer import (
 
 class PokemonCardExtractor:
     def __init__(self, languages=['en'], gpu=False):
-        # Initialize EasyOCR reader
-        self.reader = easyocr.Reader(languages, gpu=gpu)
-
-        # Path 1 Engine B: Initialize PaddleOCR reader if available
-        self.paddle_ocr = None
-        if PaddleOCR is not None:
-            try:
-                self.paddle_ocr = PaddleOCR(lang='en')
-            except Exception:
-                self.paddle_ocr = None
+        self.languages = languages
+        self.gpu = gpu
+        self._reader = None
+        self._paddle_ocr = None
+        self._paddle_initialized = False
+        self._yolo_detector = None
+        self._yolo_initialized = False
 
         # Path 2 Engine A & B: Initialize custom Pokémon recognizer and restricted alphabet classifier
         self.restricted_recognizer = RestrictedAlphabetRecognizer()
@@ -66,15 +60,6 @@ class PokemonCardExtractor:
         # Printed ID Parser and Multi-Frame Consensus Voter
         self.printed_id_parser = PrintedIDParser()
         self.multi_frame_voter = MultiFrameIDVoter(min_agreements=3)
-
-        # Initialize YOLO card detector if available
-        if get_card_detector is not None:
-            try:
-                self.yolo_detector = get_card_detector()
-            except Exception:
-                self.yolo_detector = None
-        else:
-            self.yolo_detector = None
 
         # Character confusion map common in OCR
         self.char_fix_map = {
@@ -133,6 +118,57 @@ class PokemonCardExtractor:
         self.total_substitution_targets = frozenset(
             {'086', '088', '198', '168', '180', '186', '108', '078', '068'}
         )
+
+    @property
+    def reader(self):
+        """Lazy loader for EasyOCR reader instance."""
+        if self._reader is None:
+            os.environ.setdefault("OMP_NUM_THREADS", "1")
+            os.environ.setdefault("MKL_NUM_THREADS", "1")
+            os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+            try:
+                import torch
+                torch.set_grad_enabled(False)
+                torch.set_num_threads(1)
+            except Exception:
+                pass
+            import easyocr
+            self._reader = easyocr.Reader(self.languages, gpu=self.gpu)
+        return self._reader
+
+    @property
+    def paddle_ocr(self):
+        """Lazy loader for PaddleOCR instance."""
+        if not self._paddle_initialized:
+            self._paddle_initialized = True
+            try:
+                from paddleocr import PaddleOCR
+                self._paddle_ocr = PaddleOCR(lang='en')
+            except Exception:
+                self._paddle_ocr = None
+        return self._paddle_ocr
+
+    @paddle_ocr.setter
+    def paddle_ocr(self, value):
+        self._paddle_ocr = value
+        self._paddle_initialized = True
+
+    @property
+    def yolo_detector(self):
+        """Lazy loader for YOLO detector instance."""
+        if not self._yolo_initialized:
+            self._yolo_initialized = True
+            if get_card_detector is not None:
+                try:
+                    self._yolo_detector = get_card_detector()
+                except Exception:
+                    self._yolo_detector = None
+        return self._yolo_detector
+
+    @yolo_detector.setter
+    def yolo_detector(self, value):
+        self._yolo_detector = value
+        self._yolo_initialized = True
 
     def preprocess_and_warp(self, image: np.ndarray) -> np.ndarray:
         h, w = image.shape[:2]

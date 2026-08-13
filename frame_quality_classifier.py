@@ -35,10 +35,14 @@ class FrameQualityClassifier:
         self.keras_model_path = keras_model_path
         self.model = None
         self.backend = None  # 'pytorch' or 'keras'
-        self._load_model()
+        self.device = None
+        self._model_loaded = False
 
     def _load_model(self) -> None:
         """Loads available PyTorch or Keras model weights."""
+        if self._model_loaded:
+            return
+        self._model_loaded = True
         # 1. Try PyTorch model first
         if os.path.exists(self.pytorch_model_path):
             try:
@@ -90,6 +94,8 @@ class FrameQualityClassifier:
 
     def is_available(self) -> bool:
         """Returns True if a model is loaded and ready for inference."""
+        if not self._model_loaded:
+            self._load_model()
         return self.model is not None
 
     def preprocess_image_pytorch(self, image_np: np.ndarray):

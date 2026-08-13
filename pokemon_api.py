@@ -43,7 +43,7 @@ class PokemonTCGClient:
         self._local_cards: List[Dict] = []
         self._cards_by_number: Dict[str, List[Dict]] = {}
         self._cards_by_name: Dict[str, List[Dict]] = {}
-        self._load_local_catalog()
+        self._catalog_loaded = False
 
     @staticmethod
     def _number_keys(value: str) -> List[str]:
@@ -66,6 +66,9 @@ class PokemonTCGClient:
         return list(keys)
 
     def _load_local_catalog(self) -> None:
+        if self._catalog_loaded:
+            return
+        self._catalog_loaded = True
         if not os.path.exists(self.catalog_path):
             return
         try:
@@ -123,7 +126,8 @@ class PokemonTCGClient:
         ocr_name: Optional[str],
         num_query: Optional[str],
     ) -> List[Dict]:
-        """Return a compact union of number and fuzzy-name candidates."""
+        if not self._catalog_loaded:
+            self._load_local_catalog()
         if not self._local_cards:
             return []
 

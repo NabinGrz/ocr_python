@@ -74,10 +74,33 @@ async def log_requests_middleware(request: Request, call_next):
         raise exc
 
 
-# Global singleton instances
-ocr_extractor = PokemonCardExtractor()
-tcg_client = PokemonTCGClient()
+# Environment optimization for low-memory environments
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
+# Global singleton lazy holders
+_ocr_extractor: Optional[PokemonCardExtractor] = None
+_tcg_client: Optional[PokemonTCGClient] = None
 inference_lock = asyncio.Lock()
+
+def get_ocr_extractor() -> PokemonCardExtractor:
+    """Lazy initializer for PokemonCardExtractor to keep boot RAM minimal."""
+    global _ocr_extractor
+    if _ocr_extractor is None:
+        logger.info("⚡ [Lazy Load] Initializing PokemonCardExtractor on first request...")
+        _ocr_extractor = PokemonCardExtractor(gpu=False)
+        logger.info("⚡ [Lazy Load] PokemonCardExtractor successfully loaded.")
+    return _ocr_extractor
+
+def get_tcg_client() -> PokemonTCGClient:
+    """Lazy initializer for PokemonTCGClient to keep boot RAM minimal."""
+    global _tcg_client
+    if _tcg_client is None:
+        logger.info("⚡ [Lazy Load] Initializing PokemonTCGClient on first request...")
+        _tcg_client = PokemonTCGClient()
+        logger.info("⚡ [Lazy Load] PokemonTCGClient successfully loaded.")
+    return _tcg_client
 
 MAX_IMAGE_BYTES = 15 * 1024 * 1024
 MAX_BURST_FRAMES = 20
@@ -166,9 +189,11 @@ async def scan_card_stream(files: List[UploadFile] = File(...)):
                 frame_bytes_list.append(content)
 
         logger.info("🔍 [/api/v1/scan/stream] Processing burst stream (%d non-empty frames)...", len(frame_bytes_list))
+        extractor = get_ocr_extractor()
+        client = get_tcg_client()
         async with inference_lock:
             result_dict = await run_in_threadpool(
-                ocr_extractor.process_frame_burst, frame_bytes_list, tcg_client
+                extractor.process_frame_burst, frame_bytes_list, client
             )
 
         raw_candidates = result_dict.get("candidates")
@@ -261,9 +286,11 @@ async def scan_card(
         # 1. OCR Extraction
         logger.info("   [2/3 OCR Pipeline] Running OpenCV crop & EasyOCR text extraction...")
         ocr_start = time.time()
+        extractor = get_ocr_extractor()
+        client = get_tcg_client()
         async with inference_lock:
             ocr_result = await run_in_threadpool(
-                ocr_extractor.extract_from_image, image_np, save_debug=save_debug
+                extractor.extract_from_image, image_np, save_debug=save_debug
             )
             ocr_ms = (time.time() - ocr_start) * 1000.0
 
@@ -282,7 +309,7 @@ async def scan_card(
         verify_start = time.time()
         async with inference_lock:
             verification = await run_in_threadpool(
-                tcg_client.verify_card,
+                client.verify_card,
                 extracted_id,
                 extracted_name,
                 extracted_hp,

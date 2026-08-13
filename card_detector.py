@@ -62,10 +62,13 @@ class YOLOCardDetector:
         self.model_path = model_path
         self.conf_threshold = conf_threshold
         self.model = None
-        self._load_model()
+        self._model_loaded = False
 
     def _load_model(self) -> None:
         """Loads the YOLOv8 model if the weights file exists."""
+        if self._model_loaded:
+            return
+        self._model_loaded = True
         if not os.path.exists(self.model_path):
             return
 
@@ -78,6 +81,8 @@ class YOLOCardDetector:
 
     def is_available(self) -> bool:
         """Returns True if the YOLO model is loaded and ready for inference."""
+        if not self._model_loaded:
+            self._load_model()
         return self.model is not None
 
     def detect_regions(
